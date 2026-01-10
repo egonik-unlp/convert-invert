@@ -3,7 +3,7 @@ use anyhow::Context;
 use soulseek_rs::{Client, DownloadStatus, SearchResult};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
-use tracing::instrument;
+use tracing::{Instrument, Level, instrument, span};
 
 #[derive(Debug)]
 pub struct DownloadableFile {
@@ -74,7 +74,6 @@ impl DownloadManager {
 
     #[tracing::instrument(name = "DownloadManager::download_track", skip(self))]
     async fn download_track(&self, song: DownloadableFile) -> anyhow::Result<()> {
-        // let path = format!("{:?}", self.root_location);
         let path = self.root_location.join(song.filename.clone());
         let path_str = path.as_path().to_str().context("Non valid path")?;
         tracing::info!("Downloading: {:#?}\npath:{}", song, path_str);
@@ -88,30 +87,35 @@ impl DownloadManager {
             song.size,
             path_str.to_string(),
         ) {
-            while let Ok(status) = rec.recv() {
-                if let DownloadStatus::Completed = status {
-                    tracing::info!("completado {}", song.filename.clone());
-                }
-                if let DownloadStatus::Failed | DownloadStatus::TimedOut = status {
-                    tracing::info!("fallado {}", song.filename.clone());
-                }
-                if let DownloadStatus::InProgress {
-                    bytes_downloaded,
-                    total_bytes,
-                    speed_bytes_per_sec,
-                } = status
-                {
-                    tracing::info!(
-                        "Downloaded {} of {} at {} bytes/s for {} ",
-                        bytes_downloaded,
-                        total_bytes,
-                        speed_bytes_per_sec,
-                        song.filename
-                    )
-                }
-
-                sleep(Duration::from_secs(10)).await
-            }
+            let span = tracing::info_span!("download_thread");
+            let download_handle = tokio::task::spawn_blocking(move || {
+                span.in_scope(|| {
+                    while let Ok(status) = rec.recv() {
+                        if let DownloadStatus::Completed = status {
+                            tracing::info!("completado {}", song.filename.clone());
+                        }
+                        if let DownloadStatus::Failed | DownloadStatus::TimedOut = status {
+                            tracing::info!("fallado {}", song.filename.clone());
+                        }
+                        if let DownloadStatus::InProgress {
+                            bytes_downloaded,
+                            total_bytes,
+                            speed_bytes_per_sec,
+                        } = status
+                        {
+                            tracing::info!(
+                                "Downloaded {} of {} at {} bytes/s for {} ",
+                                bytes_downloaded,
+                                total_bytes,
+                                speed_bytes_per_sec,
+                                song.filename
+                            )
+                        }
+                    }
+                    tracing::info!("Reached ending of blocking thread")
+                });
+            });
+            download_handle.await.context("Download thread down")?;
         }
         Ok(())
     }

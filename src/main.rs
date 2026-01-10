@@ -9,7 +9,6 @@ use soulseek_rs::{Client, ClientSettings};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing_subscriber::layer::SubscriberExt;
 
 fn init_tracing() {
     let subscriber = tracing_subscriber::fmt()
@@ -25,7 +24,6 @@ fn init_tracing() {
         // Build the subscriber
         .finish();
     tracing::subscriber::set_global_default(subscriber).unwrap();
-    // console_subscriber::init();
 }
 
 #[tokio::main]
@@ -80,7 +78,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Joining search thread")?
         .context("inner search")?;
-    status_thread.await.context("Joining status thread")?;
 
     judge_thread
         .await
@@ -90,5 +87,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Download thread joining")?
         .context("inner")?;
+    status_thread.await.context("Joining status thread")?;
     Ok(())
 }
