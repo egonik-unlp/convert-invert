@@ -1,15 +1,10 @@
-use std::{path::PathBuf, sync::Arc};
-
+use crate::internals::search::search_manager::Status;
+use anyhow::Context;
 use soulseek_rs::{Client, DownloadStatus, SearchResult};
-use tokio::sync::mpsc;
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::{sync::mpsc, time::sleep};
+use tracing::instrument;
 
-use crate::internals::search::threaded_search::Status;
-
-// pub enum Status {
-//     Done,
-//     Downloading,
-//     Error,
-// }
 #[derive(Debug)]
 pub struct DownloadableFile {
     pub filename: String,
@@ -37,12 +32,11 @@ impl From<SearchResult> for DownloadableFiles {
         DownloadableFiles(values)
     }
 }
-impl Into<Vec<DownloadableFile>> for DownloadableFiles {
-    fn into(self) -> Vec<DownloadableFile> {
-        self.0
+impl From<DownloadableFiles> for Vec<DownloadableFile> {
+    fn from(value: DownloadableFiles) -> Self {
+        value.0
     }
 }
-
 pub struct DownloadManager {
     client: Arc<Client>,
     root_location: PathBuf,
@@ -64,33 +58,59 @@ impl DownloadManager {
             download_queue,
         }
     }
-    pub async fn run(&mut self) {
+    #[instrument(name = "DownloadManager::run", skip(self))]
+    pub async fn run(&mut self) -> anyhow::Result<()> {
         while let Some(song) = self.download_queue.recv().await {
-            self.download_track(song).await.unwrap();
+            self.download_track(song)
+                .await
+                .context("Downloading track")?;
         }
         self.status_tx
             .send(Status::Done("song".to_string()))
             .await
-            .unwrap();
+            .context("Sending status")?;
+        Ok(())
     }
+
+    #[tracing::instrument(name = "DownloadManager::download_track", skip(self))]
     async fn download_track(&self, song: DownloadableFile) -> anyhow::Result<()> {
-        let path = format!("{:?}", self.root_location);
-        println!("Downloading: {:#?}\npath:{}", song, path);
+        // let path = format!("{:?}", self.root_location);
+        let path = self.root_location.join(song.filename.clone());
+        let path_str = path.as_path().to_str().context("Non valid path")?;
+        tracing::info!("Downloading: {:#?}\npath:{}", song, path_str);
         self.status_tx
-            .send(Status::Downloading(path.clone()))
+            .send(Status::Downloading(path_str.to_string()))
             .await
-            .unwrap();
-        if let Ok(rec) = self
-            .client
-            .download(song.filename.clone(), song.username, song.size, path)
-        {
+            .context("sending status")?;
+        if let Ok(rec) = self.client.download(
+            song.filename.clone(),
+            song.username,
+            song.size,
+            path_str.to_string(),
+        ) {
             while let Ok(status) = rec.recv() {
                 if let DownloadStatus::Completed = status {
-                    println!("completado {}", song.filename.clone());
+                    tracing::info!("completado {}", song.filename.clone());
                 }
                 if let DownloadStatus::Failed | DownloadStatus::TimedOut = status {
-                    println!("fallado {}", song.filename.clone());
+                    tracing::info!("fallado {}", song.filename.clone());
                 }
+                if let DownloadStatus::InProgress {
+                    bytes_downloaded,
+                    total_bytes,
+                    speed_bytes_per_sec,
+                } = status
+                {
+                    tracing::info!(
+                        "Downloaded {} of {} at {} bytes/s for {} ",
+                        bytes_downloaded,
+                        total_bytes,
+                        speed_bytes_per_sec,
+                        song.filename
+                    )
+                }
+
+                sleep(Duration::from_secs(10)).await
             }
         }
         Ok(())

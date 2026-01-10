@@ -10,10 +10,12 @@ use std::{
     time::{self, Duration},
 };
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use soulseek_rs::{DownloadStatus, SearchResult};
+use soulseek_rs::SearchResult;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tracing::{Instrument, instrument};
 
 use crate::internals::parsing::deserialize::Playlist;
 
@@ -60,7 +62,7 @@ pub struct SearchManager {
     pub data_rx: mpsc::Receiver<SearchItem>,
     pub status_tx: mpsc::Sender<Status>,
     pub results_tx: mpsc::Sender<SearchResult>,
-    pub handles: Vec<tokio::task::JoinHandle<()>>,
+    pub handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl SearchManager {
@@ -79,20 +81,32 @@ impl SearchManager {
         }
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self) -> anyhow::Result<()> {
         while let Some(search_item) = self.data_rx.recv().await {
             let client = self.client.clone();
             let status_tx = self.status_tx.clone();
             let results_tx = self.results_tx.clone();
-            let handle = tokio::spawn(async move {
-                track_search_task(client, search_item, status_tx, results_tx).await;
-            });
+            let name = search_item.clone().track;
+            let span = tracing::info_span!("search thread", job_id = name);
+            let handle = tokio::spawn(
+                async move {
+                    track_search_task(client, search_item, status_tx, results_tx)
+                        .await
+                        .context("Track search context")?;
+                    Ok(())
+                }
+                .instrument(span),
+            );
             self.handles.push(handle);
         }
 
         for handle in self.handles.drain(..) {
-            handle.await.unwrap();
+            handle
+                .await
+                .context("Search thread error")?
+                .context("inner error")?;
         }
+        Ok(())
     }
 }
 
@@ -112,14 +126,20 @@ pub struct DumpData {
     query: SearchItem,
 }
 
+#[instrument(
+    name = "track_search_task",
+    skip(client),
+    fields(
+        query = ?data,
+    )
+)]
 pub async fn track_search_task(
     client: Arc<soulseek_rs::Client>,
     data: SearchItem,
     status_tx: mpsc::Sender<Status>,
     results_tx: mpsc::Sender<SearchResult>,
-) {
+) -> anyhow::Result<()> {
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
-    println!("Searching for: {}", query_string);
     let cancel = Arc::new(AtomicBool::new(false));
     let mut find_history: Vec<soulseek_rs::SearchResult> = Vec::new();
 
@@ -137,48 +157,51 @@ pub async fn track_search_task(
     };
 
     let mut count = 0;
-    let mut extensions = 0;
-    status_tx.send(Status::InSearch).await.unwrap();
     'main: loop {
         if find_history.len() > 5 {
             cancel.store(true, Ordering::Relaxed);
-            println!("Not searching anymore for {} because it ends", query_string);
             break;
         };
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
         if !results.is_empty() {
             for result in results.clone() {
-                println!("Enviando results");
                 if !result.files.is_empty() {
-                    match results_tx.send(result.to_owned()).await {
-                        Ok(()) => println!("Result correctly sent: {:?}", result),
-                        Err(err) => {
-                            println!("Error in sending:\nObject:{:?}\nError{:?}", result, err)
-                        }
-                    };
+                    results_tx
+                        .send(result.to_owned())
+                        .await
+                        .context("Error sending search result")?
                 }
             }
             find_history.extend(results);
-            extensions += 1;
-            dump_data_logging(data.clone(), find_history.clone());
+            dump_data_logging(data.clone(), find_history.clone()).context("dumping")?;
         } else {
             count += 1;
         }
         if count > 1 {
-            println!(
+            tracing::info!(
                 "Exited because one consecutive empty results for: {}",
                 query_string
             );
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            status_tx.send(Status::Done(query_string)).await.unwrap();
+            status_tx
+                .send(Status::Done(query_string))
+                .await
+                .context("Issue sending finish signal to main thread")?;
             break 'main;
         }
     }
-    search_thread.await.unwrap().unwrap();
+    search_thread
+        .await
+        .unwrap()
+        .context("Inner search thread issue")?;
+    Ok(())
 }
 
-fn dump_data_logging(data: SearchItem, find_history: Vec<soulseek_rs::SearchResult>) {
+fn dump_data_logging(
+    data: SearchItem,
+    find_history: Vec<soulseek_rs::SearchResult>,
+) -> anyhow::Result<()> {
     let query = data.clone();
     let filename_dump = format!("dump_{}_{}.json", data.track.as_str(), data.artist);
     let mut file_dump = OpenOptions::new()
@@ -186,12 +209,12 @@ fn dump_data_logging(data: SearchItem, find_history: Vec<soulseek_rs::SearchResu
         .write(true)
         .truncate(true)
         .open(filename_dump.clone())
-        .unwrap();
+        .context("creating filedump")?;
     let mut filenames_dump = OpenOptions::new()
         .create(true)
         .append(true)
         .open("dump_writelens.txt")
-        .unwrap();
+        .context("creating writelens")?;
     let results: Vec<OwnSearchResult> =
         find_history.clone().into_iter().map(|f| f.into()).collect();
     let writefiles_string = format!(
@@ -204,6 +227,9 @@ fn dump_data_logging(data: SearchItem, find_history: Vec<soulseek_rs::SearchResu
         .write_all(writefiles_string.as_bytes())
         .unwrap();
     let data_dump = DumpData { results, query };
-    let dump_string = serde_json::to_string(&data_dump).unwrap();
-    file_dump.write_all(dump_string.as_bytes()).unwrap();
+    let dump_string = serde_json::to_string(&data_dump).context("Deserialization issue")?;
+    file_dump
+        .write_all(dump_string.as_bytes())
+        .context("writing in dump")?;
+    Ok(())
 }

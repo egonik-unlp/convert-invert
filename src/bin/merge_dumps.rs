@@ -1,6 +1,6 @@
 use std::{fs::OpenOptions, io::Write};
 
-use convert_invert::internals::search::threaded_search::DumpData;
+use convert_invert::internals::search::search_manager::DumpData;
 fn main() {
     let dumps: Vec<_> = std::fs::read_dir(".")
         .unwrap()

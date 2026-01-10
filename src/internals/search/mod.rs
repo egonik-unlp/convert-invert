@@ -1,1 +1,1 @@
-pub mod threaded_search;
+pub mod search_manager;
