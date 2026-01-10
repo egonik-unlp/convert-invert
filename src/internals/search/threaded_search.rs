@@ -3,7 +3,10 @@
 use std::{
     fs::OpenOptions,
     io::Write,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{self, Duration},
 };
 
@@ -136,8 +139,12 @@ pub async fn track_search_task(
     let mut count = 0;
     let mut extensions = 0;
     status_tx.send(Status::InSearch).await.unwrap();
-
     'main: loop {
+        if find_history.len() > 5 {
+            cancel.store(true, Ordering::Relaxed);
+            println!("Not searching anymore for {} because it ends", query_string);
+            break;
+        };
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
         if !results.is_empty() {
@@ -158,46 +165,19 @@ pub async fn track_search_task(
         } else {
             count += 1;
         }
-        let good_matches: Vec<_> = find_history
-            .clone()
-            .into_iter()
-            .flat_map(|result| {
-                result
-                    .files
-                    .iter()
-                    .enumerate()
-                    .map(|(i, file)| (result.clone(), file.clone(), i))
-                    .collect::<Vec<_>>()
-            })
-            .filter(|(_, file, _)| {
-                str_distance::str_distance_normalized(
-                    &file.name,
-                    &query_string,
-                    str_distance::Levenshtein::default(),
-                ) > 0.07
-            })
-            .collect();
-
-        if let Some((result, file, _file_index)) = good_matches.first()
-            && !good_matches.is_empty()
-        {
-            results_tx.send(result.to_owned()).await.unwrap();
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            break 'main;
-        }
-
-        if count > 60 {
+        if count > 1 {
             println!(
-                "Exited because five consecutive empty results for: {}",
+                "Exited because one consecutive empty results for: {}",
                 query_string
             );
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            status_tx.send(Status::Done(query_string)).await.unwrap();
             break 'main;
         }
     }
-
     search_thread.await.unwrap().unwrap();
 }
+
 fn dump_data_logging(data: SearchItem, find_history: Vec<soulseek_rs::SearchResult>) {
     let query = data.clone();
     let filename_dump = format!("dump_{}_{}.json", data.track.as_str(), data.artist);
