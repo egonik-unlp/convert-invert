@@ -52,9 +52,10 @@ impl JudgeManager {
                         .context("awaiting judge response")?;
                     if response {
                         self.download_queue
-                            .send(msg)
+                            .send(msg.clone())
                             .await
                             .context("Sending passed file")?;
+                        tracing::debug!("Sent to download_queue: {:?}", msg);
                     }
                 }
                 Ok(())
@@ -65,6 +66,7 @@ impl JudgeManager {
             .await
             .context("joining judgre thread")?
             .context("inner judge")?;
+        tracing::debug!("Judge Thread shutting down");
         Ok(())
     }
 }

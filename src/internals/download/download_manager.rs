@@ -55,21 +55,20 @@ impl DownloadManager {
     }
     #[instrument(name = "DownloadManager::run", skip(self))]
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let mut set: JoinSet<anyhow::Result<()>> = JoinSet::new();
         let mut downloaded_files = HashSet::new();
         while let Some(song) = self.download_queue.recv().await {
+            tracing::debug!("Started loop for {:?}", song.clone());
+            let _othersong = song.clone();
             let client = Arc::clone(&self.client);
             let download_location = self.root_location.clone();
             if is_audio_file(song.query.filename.clone())
                 && !has_been_downloaded(&song.track, &downloaded_files)
             {
                 downloaded_files.insert(song.track.clone());
-                set.spawn(async move {
-                    download_track(song.query, download_location.clone(), client)
-                        .await
-                        .context("Downloading track")?;
-                    Ok(())
-                });
+                download_track(song.query, download_location.clone(), client)
+                    .await
+                    .context("Downloading track")?;
+                // })
                 tracing::info!("After download track in run");
             } else {
                 tracing::info!(
@@ -77,6 +76,7 @@ impl DownloadManager {
                     song.query.filename
                 )
             }
+            tracing::debug!("Download loop closed for = {:?}", _othersong);
         }
         Ok(())
     }

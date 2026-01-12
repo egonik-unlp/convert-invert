@@ -4,6 +4,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::SearchResult;
 use std::{
+    collections::HashMap,
     fmt::Display,
     fs::OpenOptions,
     io::Write,
@@ -15,6 +16,8 @@ use tokio::time::sleep;
 use tracing::{Instrument, instrument};
 
 use crate::internals::parsing::deserialize::Playlist;
+
+const TIMES_WITH_NO_NEW_FILES: usize = 7;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
@@ -73,7 +76,8 @@ pub struct SearchManager {
     pub client: Arc<soulseek_rs::Client>,
     pub data_rx: mpsc::Receiver<SearchItem>,
     pub results_tx: mpsc::Sender<JudgeSubmission>,
-    pub handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    pub handles: HashMap<SearchItem, tokio::task::JoinHandle<anyhow::Result<()>>>,
+    // pub handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl SearchManager {
@@ -86,7 +90,7 @@ impl SearchManager {
             client,
             data_rx,
             results_tx,
-            handles: Vec::new(),
+            handles: HashMap::new(),
         }
     }
     fn build_submissions(track: SearchItem, result: SearchResult) -> Vec<JudgeSubmission> {
@@ -106,23 +110,28 @@ impl SearchManager {
     #[instrument(skip(self))]
     pub async fn run(&mut self) -> anyhow::Result<()> {
         while let Some(search_item) = self.data_rx.recv().await {
+            tracing::debug!("Received search request for: {:?}", search_item.clone());
             let client = self.client.clone();
             let results_tx = self.results_tx.clone();
             let name = search_item.clone().track;
-            let span = tracing::info_span!("search thread", job_id = name);
+            let item = search_item.clone();
+            let span = tracing::info_span!("track-{}", name);
             let handle = tokio::spawn(
                 async move {
-                    track_search_task(client, search_item, results_tx)
+                    track_search_task(client, item, results_tx)
                         .await
                         .context("Track search context")?;
                     Ok(())
                 }
                 .instrument(span),
             );
-            self.handles.push(handle);
+            self.handles.insert(search_item.clone(), handle);
+            tracing::info!("Closed loop for run search");
         }
 
-        for handle in self.handles.drain(..) {
+        tracing::info!("Excited while loop for run search");
+        for (file, handle) in self.handles.drain() {
+            tracing::debug!("Joining thread for {} - {}", file.track, file.artist);
             handle
                 .await
                 .context("Search thread error")?
@@ -163,7 +172,6 @@ pub async fn track_search_task(
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
     let cancel = Arc::new(AtomicBool::new(false));
     let mut find_history: Vec<soulseek_rs::SearchResult> = Vec::new();
-
     let search_thread = {
         let search_client = client.clone();
         let query_string_search = query_string.clone();
@@ -178,27 +186,33 @@ pub async fn track_search_task(
     };
 
     let mut count = 0;
+    let mut total_files_found = 0;
+    #[allow(unused_parens)]
     'main: loop {
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
-        if !results.is_empty() {
-            for result in results.clone() {
+        let results_count: usize = results.iter().map(|res| res.files.len()).sum();
+        if !results.is_empty() && !total_files_found.eq(&results_count) {
+            find_history.extend(results.clone());
+            total_files_found += (results_count - total_files_found);
+            for result in results {
                 let submisssions = SearchManager::build_submissions(data.clone(), result);
                 for submission in submisssions {
+                    tracing::debug!("Sent submission: {:?}", submission.clone());
                     results_tx
                         .send(submission)
                         .await
                         .context("Error sending search result")?
                 }
             }
-            find_history.extend(results);
             dump_data_logging(data.clone(), find_history.clone()).context("dumping")?;
         } else {
             count += 1;
         }
-        if count > 7 {
+        if count > TIMES_WITH_NO_NEW_FILES {
             tracing::info!(
-                "Exited because one consecutive empty results for: {}",
+                "Exited because {} consecutive empty results for: {}",
+                TIMES_WITH_NO_NEW_FILES,
                 query_string
             );
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);

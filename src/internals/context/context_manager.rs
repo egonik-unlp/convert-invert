@@ -4,6 +4,7 @@ use crate::internals::search::search_manager::{
     DownloadableFile, OwnSearchResult, SearchItem, Status,
 };
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ContextManager {
     status: mpsc::Receiver<Status>,
