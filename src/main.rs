@@ -1,11 +1,10 @@
 use anyhow::Context;
 use convert_invert::internals::download::download_manager::DownloadManager;
-use convert_invert::internals::judge::judge_manager::{JudgeManager, Levenshtein, LocalLLM};
+use convert_invert::internals::judge::judge_manager::{JudgeManager, Levenshtein};
 use convert_invert::internals::{
     parsing::deserialize,
-    search::search_manager::{SearchItem, SearchManager, Status},
+    search::search_manager::{SearchItem, SearchManager},
 };
-use opentelemetry::global;
 use soulseek_rs::{Client, ClientSettings};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -30,8 +29,8 @@ fn init_tracing() {
         .with_target(true)
         // Build the subscriber
         .finish();
-    // tracing::subscriber::set_global_default(subscriber).unwrap();
-    console_subscriber::init();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    // console_subscriber::init();
 }
 
 #[tokio::main]
@@ -40,8 +39,9 @@ async fn main() -> anyhow::Result<()> {
     let data_string = include_str!("./internals/parsing/sample.json");
     let data: deserialize::Playlist = serde_json::from_str(data_string).unwrap();
     let queries: Vec<SearchItem> = data.into();
+    let username = "nvidia";
     let client_settings = ClientSettings {
-        username: "shimadzu".to_string(),
+        username: username.to_string(),
         password: "0112358".to_string(),
         listen_port: 3217,
         ..Default::default()
@@ -49,35 +49,20 @@ async fn main() -> anyhow::Result<()> {
     let mut client = Client::with_settings(client_settings);
     client.connect();
     client.login().context("client login")?;
-    println!("logged in");
+    println!("logged in with client: {}", username);
 
     let download_path =
-        PathBuf::from_str("/home/gonik/Music/falopa").context("Acquiring download dir")?;
+        PathBuf::from_str("/home/gonik/Music/tercera_falopa").context("Acquiring download dir")?;
     let client = Arc::new(client);
     let start_time = chrono::Local::now();
     let (data_tx, data_rx) = tokio::sync::mpsc::channel(100);
-    let (status_tx, mut status_rx) = tokio::sync::mpsc::channel(100);
     let (results_tx, results_rx) = tokio::sync::mpsc::channel(100);
     let (download_tx, download_rx) = tokio::sync::mpsc::channel(100);
-    let mut search_manager =
-        SearchManager::new(client.clone(), data_rx, status_tx.clone(), results_tx);
-    let llm_judge = LocalLLM::new("http:localhost".to_string(), 6111, 0.75);
+    let mut search_manager = SearchManager::new(client.clone(), data_rx, results_tx);
     let lev_judge = Levenshtein::new(0.75);
     let judge_manager = JudgeManager::new(results_rx, download_tx, Box::new(lev_judge));
-    // let judge_manager = JudgeManager::new(results_rx, download_tx, Box::new(llm_judge));
+    let mut download_manager = DownloadManager::new(client.clone(), download_path, download_rx);
 
-    let mut download_manager =
-        DownloadManager::new(client.clone(), download_path, status_tx, download_rx);
-
-    let status_thread = tokio::spawn(async move {
-        while let Some(msg) = status_rx.recv().await {
-            match msg {
-                Status::Downloading(file) => println!("Downloading: {}", file),
-                Status::Done(file) => println!("Downloaded: {}", file),
-                Status::InSearch => println!("Searching..."),
-            }
-        }
-    });
     let search_thread = tokio::spawn(async move { search_manager.run().await });
     let judge_thread = tokio::spawn(async move { judge_manager.run2().await });
     let download_thread = tokio::spawn(async move { download_manager.run().await });
@@ -106,6 +91,5 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Download thread joining")?
         .context("inner")?;
-    status_thread.await.context("Joining status thread")?;
     Ok(())
 }

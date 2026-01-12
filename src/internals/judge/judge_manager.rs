@@ -1,12 +1,8 @@
-use crate::internals::download::download_manager::DownloadableFiles;
-use crate::internals::search::search_manager::{
-    DownloadableFile, JudgeSubmission, OwnSearchResult, SearchItem,
-};
+use crate::internals::search::search_manager::JudgeSubmission;
 use anyhow::{Context, Ok};
 use async_trait::async_trait;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use soulseek_rs::SearchResult;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, instrument};
@@ -26,13 +22,13 @@ pub trait Judge: Send + Sync {
 
 pub struct JudgeManager {
     pub judge_queue: Receiver<JudgeSubmission>,
-    pub download_queue: Sender<DownloadableFile>,
+    pub download_queue: Sender<JudgeSubmission>,
     pub method: Box<dyn Judge>,
 }
 impl JudgeManager {
     pub fn new(
         judge_queue: Receiver<JudgeSubmission>,
-        download_queue: Sender<DownloadableFile>,
+        download_queue: Sender<JudgeSubmission>,
         method: Box<dyn Judge>,
     ) -> JudgeManager {
         JudgeManager {
@@ -56,7 +52,7 @@ impl JudgeManager {
                         .context("awaiting judge response")?;
                     if response {
                         self.download_queue
-                            .send(msg.query)
+                            .send(msg)
                             .await
                             .context("Sending passed file")?;
                     }
@@ -77,16 +73,6 @@ pub struct LocalLLM {
     pub address: String,
     pub port: i32,
     pub score_cutoff: f32,
-}
-#[derive(Debug, Serialize, Deserialize)]
-struct ScoreRequest {
-    track: OwnSearchResult,
-    query: SearchItem,
-}
-impl ScoreRequest {
-    pub fn new(track: OwnSearchResult, query: SearchItem) -> Self {
-        ScoreRequest { track, query }
-    }
 }
 impl LocalLLM {
     pub fn new(address: String, port: i32, score_cutoff: f32) -> Self {

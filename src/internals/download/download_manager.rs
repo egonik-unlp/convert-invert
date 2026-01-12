@@ -1,13 +1,9 @@
-use crate::internals::search::search_manager::{DownloadableFile, Status};
+use crate::internals::search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem};
 use anyhow::Context;
 use soulseek_rs::{Client, DownloadStatus, SearchResult};
-use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
-use tokio::{
-    sync::{Semaphore, mpsc},
-    task::{JoinHandle, JoinSet},
-    time::sleep,
-};
-use tracing::{Instrument, Level, instrument, span};
+use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::Arc};
+use tokio::{sync::mpsc, task::JoinSet};
+use tracing::instrument;
 
 fn is_audio_file(filename: String) -> bool {
     let lc = filename.to_lowercase();
@@ -42,62 +38,64 @@ impl From<DownloadableFiles> for Vec<DownloadableFile> {
 pub struct DownloadManager {
     client: Arc<Client>,
     root_location: PathBuf,
-    status_tx: mpsc::Sender<Status>,
-    download_queue: mpsc::Receiver<DownloadableFile>,
+    download_queue: mpsc::Receiver<JudgeSubmission>,
 }
 
 impl DownloadManager {
     pub fn new(
         client: Arc<Client>,
         root_location: PathBuf,
-        status_tx: mpsc::Sender<Status>,
-        download_queue: mpsc::Receiver<DownloadableFile>,
+        download_queue: mpsc::Receiver<JudgeSubmission>,
     ) -> Self {
         DownloadManager {
             client,
             root_location,
-            status_tx,
             download_queue,
         }
     }
     #[instrument(name = "DownloadManager::run", skip(self))]
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        let max_parallel_downloads = 3usize;
-        // self.download_queue
-        let sem = Arc::new(Semaphore::new(max_parallel_downloads));
         let mut set: JoinSet<anyhow::Result<()>> = JoinSet::new();
+        let mut downloaded_files = HashSet::new();
         while let Some(song) = self.download_queue.recv().await {
-            if is_audio_file(song.filename.clone()) {
-                let permit = sem.acquire().await.context("Permit request denied")?;
-                set.spawn(async {
-                    download_track(self, song)
+            let client = Arc::clone(&self.client);
+            let download_location = self.root_location.clone();
+            if is_audio_file(song.query.filename.clone())
+                && !has_been_downloaded(&song.track, &downloaded_files)
+            {
+                downloaded_files.insert(song.track.clone());
+                set.spawn(async move {
+                    download_track(song.query, download_location.clone(), client)
                         .await
                         .context("Downloading track")?;
-                    let _permit = permit;
                     Ok(())
                 });
                 tracing::info!("After download track in run");
             } else {
-                tracing::info!("Rejected non song file = {}", song.filename)
+                tracing::info!(
+                    "Rejected non song & already downloaded file = {}",
+                    song.query.filename
+                )
             }
         }
         Ok(())
     }
 }
 
-#[tracing::instrument(name = "DownloadManager::download_track", skip(download_manager, song), fields(track=song.filename, username = song.username))]
+fn has_been_downloaded(track: &SearchItem, tracks: &HashSet<SearchItem>) -> bool {
+    tracks.contains(track)
+}
+
+#[tracing::instrument(name = "DownloadManager::download_track", skip(song, path, client))]
 async fn download_track(
-    download_manager: &DownloadManager,
     song: DownloadableFile,
+    path: PathBuf,
+    client: Arc<Client>,
 ) -> anyhow::Result<()> {
     let song_path = PathBuf::from_str(&song.filename).context("Can't parse filename")?;
-    //TODO: Solve unwrap here
-    let path = download_manager
-        .root_location
-        .join(song_path.file_name().unwrap());
+    let path = path.join(song_path.file_name().context("Cannot create file")?);
     let path_str = path.as_path().to_str().context("Non valid path")?;
-    tracing::info!("\n\nfullpath: {:#?}\npath:{}", song, path_str);
-    if let Ok(rec) = download_manager.client.download(
+    if let Ok(rec) = client.download(
         song.filename.clone(),
         song.username,
         song.size,

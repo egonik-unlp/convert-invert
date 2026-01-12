@@ -1,26 +1,22 @@
 #![allow(unused_labels)]
 
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
+use soulseek_rs::SearchResult;
 use std::{
     fmt::Display,
     fs::OpenOptions,
     io::Write,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, atomic::AtomicBool},
     time::{self, Duration},
 };
-
-use anyhow::Context;
-use serde::{Deserialize, Serialize};
-use soulseek_rs::SearchResult;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{Instrument, instrument};
 
-use crate::internals::{judge::judge_manager::JudgeManager, parsing::deserialize::Playlist};
+use crate::internals::parsing::deserialize::Playlist;
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
     pub track: String,
     pub album: String,
@@ -76,7 +72,6 @@ pub struct JudgeSubmission {
 pub struct SearchManager {
     pub client: Arc<soulseek_rs::Client>,
     pub data_rx: mpsc::Receiver<SearchItem>,
-    pub status_tx: mpsc::Sender<Status>,
     pub results_tx: mpsc::Sender<JudgeSubmission>,
     pub handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
@@ -85,13 +80,11 @@ impl SearchManager {
     pub fn new(
         client: Arc<soulseek_rs::Client>,
         data_rx: tokio::sync::mpsc::Receiver<SearchItem>,
-        status_tx: tokio::sync::mpsc::Sender<Status>,
         results_tx: tokio::sync::mpsc::Sender<JudgeSubmission>,
     ) -> Self {
         SearchManager {
             client,
             data_rx,
-            status_tx,
             results_tx,
             handles: Vec::new(),
         }
@@ -114,13 +107,12 @@ impl SearchManager {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         while let Some(search_item) = self.data_rx.recv().await {
             let client = self.client.clone();
-            let status_tx = self.status_tx.clone();
             let results_tx = self.results_tx.clone();
             let name = search_item.clone().track;
             let span = tracing::info_span!("search thread", job_id = name);
             let handle = tokio::spawn(
                 async move {
-                    track_search_task(client, search_item, status_tx, results_tx)
+                    track_search_task(client, search_item, results_tx)
                         .await
                         .context("Track search context")?;
                     Ok(())
@@ -158,7 +150,7 @@ pub struct DumpData {
 
 #[instrument(
     name = "track_search_task",
-    skip(client,status_tx, results_tx),
+    skip(client, results_tx),
     fields(
         query = ?data.track,
     )
@@ -166,7 +158,6 @@ pub struct DumpData {
 pub async fn track_search_task(
     client: Arc<soulseek_rs::Client>,
     data: SearchItem,
-    status_tx: mpsc::Sender<Status>,
     results_tx: mpsc::Sender<JudgeSubmission>,
 ) -> anyhow::Result<()> {
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
@@ -226,7 +217,7 @@ fn dump_data_logging(
     find_history: Vec<soulseek_rs::SearchResult>,
 ) -> anyhow::Result<()> {
     let query = data.clone();
-    let filename_dump = format!("dump_{}_{}.json", data.track.as_str(), data.artist);
+    let filename_dump = format!("dumps/dump_{}_{}.json", data.track.as_str(), data.artist);
     let mut file_dump = OpenOptions::new()
         .create(true)
         .write(true)
