@@ -2,7 +2,11 @@ use crate::internals::search::search_manager::{DownloadableFile, Status};
 use anyhow::Context;
 use soulseek_rs::{Client, DownloadStatus, SearchResult};
 use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
-use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::{JoinHandle, JoinSet},
+    time::sleep,
+};
 use tracing::{Instrument, Level, instrument, span};
 
 fn is_audio_file(filename: String) -> bool {
@@ -57,12 +61,21 @@ impl DownloadManager {
         }
     }
     #[instrument(name = "DownloadManager::run", skip(self))]
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        let max_parallel_downloads = 3usize;
+        // self.download_queue
+        let sem = Arc::new(Semaphore::new(max_parallel_downloads));
+        let mut set: JoinSet<anyhow::Result<()>> = JoinSet::new();
         while let Some(song) = self.download_queue.recv().await {
             if is_audio_file(song.filename.clone()) {
-                self.download_track(song)
-                    .await
-                    .context("Downloading track")?;
+                let permit = sem.acquire().await.context("Permit request denied")?;
+                set.spawn(async {
+                    download_track(self, song)
+                        .await
+                        .context("Downloading track")?;
+                    let _permit = permit;
+                    Ok(())
+                });
                 tracing::info!("After download track in run");
             } else {
                 tracing::info!("Rejected non song file = {}", song.filename)
@@ -70,54 +83,59 @@ impl DownloadManager {
         }
         Ok(())
     }
+}
 
-    #[tracing::instrument(name = "DownloadManager::download_track", skip(self), fields(track=song.filename, username = song.username))]
-    async fn download_track(&self, song: DownloadableFile) -> anyhow::Result<()> {
-        let song_path = PathBuf::from_str(&song.filename).context("Can't parse filename")?;
-        //TODO: Solve unwrap here
-        let path = self.root_location.join(song_path.file_name().unwrap());
-        let path_str = path.as_path().to_str().context("Non valid path")?;
-        tracing::info!("\n\nfullpath: {:#?}\npath:{}", song, path_str);
-        if let Ok(rec) = self.client.download(
-            song.filename.clone(),
-            song.username,
-            song.size,
-            path_str.to_string(),
-        ) {
-            let span = tracing::info_span!("download_thread");
-            let download_handle = tokio::task::spawn_blocking(move || {
-                span.in_scope(|| {
-                    while let Ok(status) = rec.recv() {
-                        if let DownloadStatus::Completed = status {
-                            tracing::info!("completado {}", song.filename.clone());
-                            break;
-                        }
-                        if let DownloadStatus::Failed | DownloadStatus::TimedOut = status {
-                            tracing::info!("fallado {}", song.filename.clone());
-                            break;
-                        }
-                        if let DownloadStatus::InProgress {
+#[tracing::instrument(name = "DownloadManager::download_track", skip(download_manager, song), fields(track=song.filename, username = song.username))]
+async fn download_track(
+    download_manager: &DownloadManager,
+    song: DownloadableFile,
+) -> anyhow::Result<()> {
+    let song_path = PathBuf::from_str(&song.filename).context("Can't parse filename")?;
+    //TODO: Solve unwrap here
+    let path = download_manager
+        .root_location
+        .join(song_path.file_name().unwrap());
+    let path_str = path.as_path().to_str().context("Non valid path")?;
+    tracing::info!("\n\nfullpath: {:#?}\npath:{}", song, path_str);
+    if let Ok(rec) = download_manager.client.download(
+        song.filename.clone(),
+        song.username,
+        song.size,
+        path_str.to_string(),
+    ) {
+        let span = tracing::info_span!("download_thread");
+        let download_handle = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| {
+                while let Ok(status) = rec.recv() {
+                    if let DownloadStatus::Completed = status {
+                        tracing::info!("completado {}", song.filename.clone());
+                        break;
+                    }
+                    if let DownloadStatus::Failed | DownloadStatus::TimedOut = status {
+                        tracing::info!("fallado {}", song.filename.clone());
+                        break;
+                    }
+                    if let DownloadStatus::InProgress {
+                        bytes_downloaded,
+                        total_bytes,
+                        speed_bytes_per_sec,
+                    } = status
+                    {
+                        tracing::info!(
+                            "Downloaded {} of {} at {} bytes/s for {} ",
                             bytes_downloaded,
                             total_bytes,
                             speed_bytes_per_sec,
-                        } = status
-                        {
-                            tracing::info!(
-                                "Downloaded {} of {} at {} bytes/s for {} ",
-                                bytes_downloaded,
-                                total_bytes,
-                                speed_bytes_per_sec,
-                                song.filename
-                            )
-                        }
+                            song.filename
+                        )
                     }
-                    tracing::info!("Reached ending of blocking thread")
-                });
+                }
+                tracing::info!("Reached ending of blocking thread")
             });
-            tracing::info!("Pre await download handle");
-            download_handle.await.context("Download thread down")?;
-            tracing::info!("Post await download handle");
-        }
-        Ok(())
+        });
+        tracing::info!("Pre await download handle");
+        download_handle.await.context("Download thread down")?;
+        tracing::info!("Post await download handle");
     }
+    Ok(())
 }
