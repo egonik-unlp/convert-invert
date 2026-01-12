@@ -1,6 +1,8 @@
-use crate::internals::download::download_manager::{DownloadableFile, DownloadableFiles};
-use crate::internals::search::search_manager::OwnSearchResult;
-use anyhow::Context;
+use crate::internals::download::download_manager::DownloadableFiles;
+use crate::internals::search::search_manager::{
+    DownloadableFile, JudgeSubmission, OwnSearchResult, SearchItem,
+};
+use anyhow::{Context, Ok};
 use async_trait::async_trait;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -18,18 +20,18 @@ pub struct ResponseFormat {
 
 #[async_trait]
 pub trait Judge: Send + Sync {
-    async fn judge(&self, track: SearchResult) -> anyhow::Result<bool>;
-    async fn judge_score(&self, track: SearchResult) -> anyhow::Result<f32>;
+    async fn judge(&self, submission: JudgeSubmission) -> anyhow::Result<bool>;
+    async fn judge_score(&self, submission: JudgeSubmission) -> anyhow::Result<f32>;
 }
 
 pub struct JudgeManager {
-    pub judge_queue: Receiver<SearchResult>,
+    pub judge_queue: Receiver<JudgeSubmission>,
     pub download_queue: Sender<DownloadableFile>,
     pub method: Box<dyn Judge>,
 }
 impl JudgeManager {
     pub fn new(
-        judge_queue: Receiver<SearchResult>,
+        judge_queue: Receiver<JudgeSubmission>,
         download_queue: Sender<DownloadableFile>,
         method: Box<dyn Judge>,
     ) -> JudgeManager {
@@ -39,31 +41,6 @@ impl JudgeManager {
             method,
         }
     }
-    #[instrument(name = "JudgeManager::run", skip(self))]
-    pub fn run(mut self) -> anyhow::Result<()> {
-        let judge_thread = tokio::spawn(async move {
-            loop {
-                println!("Awaiting result from search...");
-                match self.judge_queue.recv().await {
-                    Some(msg) => {
-                        let response = self.method.judge(msg.clone()).await.unwrap();
-                        if response {
-                            let files: DownloadableFiles = msg.clone().into();
-                            for file in files.0 {
-                                self.download_queue.send(file).await.unwrap();
-                            }
-                        }
-                    }
-                    None => {
-                        println!("Channel closed. Judge thread exiting.");
-                        break;
-                    }
-                }
-            }
-        });
-        Ok(())
-    }
-
     #[instrument(name = "JudgeManager::run2", skip(self))]
     pub async fn run2(mut self) -> anyhow::Result<()> {
         tracing::info!("en fn out j t");
@@ -78,13 +55,10 @@ impl JudgeManager {
                         .await
                         .context("awaiting judge response")?;
                     if response {
-                        let files: DownloadableFiles = msg.clone().into();
-                        for file in files.0 {
-                            self.download_queue
-                                .send(file)
-                                .await
-                                .context("Sending passed file")?;
-                        }
+                        self.download_queue
+                            .send(msg.query)
+                            .await
+                            .context("Sending passed file")?;
                     }
                 }
                 Ok(())
@@ -104,6 +78,16 @@ pub struct LocalLLM {
     pub port: i32,
     pub score_cutoff: f32,
 }
+#[derive(Debug, Serialize, Deserialize)]
+struct ScoreRequest {
+    track: OwnSearchResult,
+    query: SearchItem,
+}
+impl ScoreRequest {
+    pub fn new(track: OwnSearchResult, query: SearchItem) -> Self {
+        ScoreRequest { track, query }
+    }
+}
 impl LocalLLM {
     pub fn new(address: String, port: i32, score_cutoff: f32) -> Self {
         LocalLLM {
@@ -112,12 +96,11 @@ impl LocalLLM {
             score_cutoff,
         }
     }
-    #[instrument(name = "LocalLLM::get_score", skip(self), fields(?track))]
-    async fn get_score(&self, track: SearchResult) -> anyhow::Result<ResponseFormat> {
-        let own_track: OwnSearchResult = track.into();
+    #[instrument(name = "LocalLLM::get_score", skip(self, submission))]
+    async fn get_score(&self, submission: JudgeSubmission) -> anyhow::Result<ResponseFormat> {
         let url = Url::parse(&format!("{}:{}/score", self.address, self.port)).unwrap();
         let client = reqwest::Client::new();
-        let str_val = serde_json::to_string(&own_track).context("Parsing own track")?;
+        let str_val = serde_json::to_string(&submission).context("Parsing own track")?;
         let res = client
             .post(url)
             .header("Content-Type", "application/json")
@@ -133,18 +116,19 @@ impl LocalLLM {
 
 #[async_trait]
 impl Judge for LocalLLM {
-    #[instrument(name = "LocalLLM::judge", skip(self), fields(?track))]
-    async fn judge(&self, track: SearchResult) -> anyhow::Result<bool> {
-        let response = self.get_score(track).await.context("Getting score")?;
+    #[instrument(name = "LocalLLM::judge", skip(self), fields(username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
+    async fn judge(&self, submission: JudgeSubmission) -> anyhow::Result<bool> {
+        let response = self.get_score(submission).await.context("Getting score")?;
+        tracing::info!("{:?}", response);
         match response.score {
             x if x.unwrap_or_default() > self.score_cutoff => Ok(true),
             _ => Ok(false),
         }
     }
 
-    #[instrument(name = "LocalLLM::judge", skip(self), fields(?track))]
-    async fn judge_score(&self, track: SearchResult) -> anyhow::Result<f32> {
-        let response = self.get_score(track).await.context("Getting score")?;
+    #[instrument(name = "LocalLLM::judge", skip(self), fields(username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
+    async fn judge_score(&self, submission: JudgeSubmission) -> anyhow::Result<f32> {
+        let response = self.get_score(submission).await.context("Getting score")?;
         Ok(response.score.unwrap_or_default())
     }
 }
@@ -152,16 +136,31 @@ impl Judge for LocalLLM {
 pub struct Levenshtein {
     pub score_cutoff: f32,
 }
-impl Levenshtein {}
+impl Levenshtein {
+    pub fn new(score_cutoff: f32) -> Self {
+        Levenshtein { score_cutoff }
+    }
+}
 
 #[async_trait]
 impl Judge for Levenshtein {
-    async fn judge(&self, track: SearchResult) -> anyhow::Result<bool> {
-        todo!()
+    #[instrument(name = "Levenshtein::judge", skip(self, submission), fields(username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
+    async fn judge(&self, submission: JudgeSubmission) -> anyhow::Result<bool> {
+        let distance = str_distance::Levenshtein::default();
+        let a = format!("{}", submission.track);
+        let b = submission.query.filename;
+        let distance_val = str_distance::str_distance_normalized(a, b, distance);
+        tracing::info!("score = {}", distance_val);
+        let val = distance_val > self.score_cutoff as f64;
+        Ok(val)
     }
-    async fn judge_score(&self, track: SearchResult) -> anyhow::Result<f32> {
-        let own_track: OwnSearchResult = track.into();
-        let str_val = serde_json::to_string(&own_track).unwrap();
-        todo!()
+    #[instrument(name = "Levenshtein::judge_score", skip(self,submission), fields(username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
+    async fn judge_score(&self, submission: JudgeSubmission) -> anyhow::Result<f32> {
+        let distance = str_distance::Levenshtein::default();
+        let a = format!("{}", submission.track);
+        let b = submission.query.filename;
+        let distance_val = str_distance::str_distance_normalized(a, b, distance);
+        tracing::info!("score = {}", distance_val);
+        Ok(distance_val as f32)
     }
 }

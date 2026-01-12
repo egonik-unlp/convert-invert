@@ -1,15 +1,13 @@
-use crate::internals::search::search_manager::Status;
+use crate::internals::search::search_manager::{DownloadableFile, Status};
 use anyhow::Context;
 use soulseek_rs::{Client, DownloadStatus, SearchResult};
-use std::{path::PathBuf, sync::Arc, time::Duration};
-use tokio::{sync::mpsc, time::sleep};
+use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::{Instrument, Level, instrument, span};
 
-#[derive(Debug)]
-pub struct DownloadableFile {
-    pub filename: String,
-    pub username: String,
-    pub size: u64,
+fn is_audio_file(filename: String) -> bool {
+    let lc = filename.to_lowercase();
+    lc.ends_with(".mp3") || lc.ends_with(".flac") || lc.ends_with(".aiff")
 }
 
 pub struct DownloadableFiles(pub Vec<DownloadableFile>);
@@ -59,28 +57,27 @@ impl DownloadManager {
         }
     }
     #[instrument(name = "DownloadManager::run", skip(self))]
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         while let Some(song) = self.download_queue.recv().await {
-            self.download_track(song)
-                .await
-                .context("Downloading track")?;
+            if is_audio_file(song.filename.clone()) {
+                self.download_track(song)
+                    .await
+                    .context("Downloading track")?;
+                tracing::info!("After download track in run");
+            } else {
+                tracing::info!("Rejected non song file = {}", song.filename)
+            }
         }
-        self.status_tx
-            .send(Status::Done("song".to_string()))
-            .await
-            .context("Sending status")?;
         Ok(())
     }
 
-    #[tracing::instrument(name = "DownloadManager::download_track", skip(self))]
+    #[tracing::instrument(name = "DownloadManager::download_track", skip(self), fields(track=song.filename, username = song.username))]
     async fn download_track(&self, song: DownloadableFile) -> anyhow::Result<()> {
-        let path = self.root_location.join(song.filename.clone());
+        let song_path = PathBuf::from_str(&song.filename).context("Can't parse filename")?;
+        //TODO: Solve unwrap here
+        let path = self.root_location.join(song_path.file_name().unwrap());
         let path_str = path.as_path().to_str().context("Non valid path")?;
-        tracing::info!("Downloading: {:#?}\npath:{}", song, path_str);
-        self.status_tx
-            .send(Status::Downloading(path_str.to_string()))
-            .await
-            .context("sending status")?;
+        tracing::info!("\n\nfullpath: {:#?}\npath:{}", song, path_str);
         if let Ok(rec) = self.client.download(
             song.filename.clone(),
             song.username,
@@ -93,9 +90,11 @@ impl DownloadManager {
                     while let Ok(status) = rec.recv() {
                         if let DownloadStatus::Completed = status {
                             tracing::info!("completado {}", song.filename.clone());
+                            break;
                         }
                         if let DownloadStatus::Failed | DownloadStatus::TimedOut = status {
                             tracing::info!("fallado {}", song.filename.clone());
+                            break;
                         }
                         if let DownloadStatus::InProgress {
                             bytes_downloaded,
@@ -115,7 +114,9 @@ impl DownloadManager {
                     tracing::info!("Reached ending of blocking thread")
                 });
             });
+            tracing::info!("Pre await download handle");
             download_handle.await.context("Download thread down")?;
+            tracing::info!("Post await download handle");
         }
         Ok(())
     }

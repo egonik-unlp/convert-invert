@@ -1,8 +1,7 @@
 use tokio::sync::mpsc;
 
-use crate::internals::{
-    download::download_manager::DownloadableFile,
-    search::search_manager::{OwnSearchResult, SearchItem, Status},
+use crate::internals::search::search_manager::{
+    DownloadableFile, OwnSearchResult, SearchItem, Status,
 };
 
 #[derive(Debug)]

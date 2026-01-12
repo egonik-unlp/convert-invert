@@ -1,6 +1,7 @@
 #![allow(unused_labels)]
 
 use std::{
+    fmt::Display,
     fs::OpenOptions,
     io::Write,
     sync::{
@@ -17,14 +18,13 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{Instrument, instrument};
 
-use crate::internals::parsing::deserialize::Playlist;
+use crate::internals::{judge::judge_manager::JudgeManager, parsing::deserialize::Playlist};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct SearchItem {
     pub track: String,
     pub album: String,
     pub artist: String,
-    pub found: bool,
 }
 impl From<Playlist> for Vec<SearchItem> {
     fn from(value: Playlist) -> Vec<SearchItem> {
@@ -46,7 +46,6 @@ impl From<Playlist> for Vec<SearchItem> {
                     .unwrap()
                     .clone(),
                 album: tr.track.unwrap().album.unwrap().name.unwrap(),
-                found: false,
             })
             .collect()
     }
@@ -57,11 +56,28 @@ pub enum Status {
     InSearch,
     Downloading(String),
 }
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DownloadableFile {
+    pub filename: String,
+    pub username: String,
+    pub size: u64,
+}
+impl Display for SearchItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} - {} - {}", self.track, self.artist, self.album)
+    }
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JudgeSubmission {
+    pub track: SearchItem,
+    pub query: DownloadableFile,
+}
+
 pub struct SearchManager {
     pub client: Arc<soulseek_rs::Client>,
     pub data_rx: mpsc::Receiver<SearchItem>,
     pub status_tx: mpsc::Sender<Status>,
-    pub results_tx: mpsc::Sender<SearchResult>,
+    pub results_tx: mpsc::Sender<JudgeSubmission>,
     pub handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
@@ -70,7 +86,7 @@ impl SearchManager {
         client: Arc<soulseek_rs::Client>,
         data_rx: tokio::sync::mpsc::Receiver<SearchItem>,
         status_tx: tokio::sync::mpsc::Sender<Status>,
-        results_tx: tokio::sync::mpsc::Sender<SearchResult>,
+        results_tx: tokio::sync::mpsc::Sender<JudgeSubmission>,
     ) -> Self {
         SearchManager {
             client,
@@ -80,7 +96,21 @@ impl SearchManager {
             handles: Vec::new(),
         }
     }
-
+    fn build_submissions(track: SearchItem, result: SearchResult) -> Vec<JudgeSubmission> {
+        result
+            .files
+            .into_iter()
+            .map(|f| JudgeSubmission {
+                query: DownloadableFile {
+                    filename: f.name,
+                    size: f.size,
+                    username: f.username,
+                },
+                track: track.clone(),
+            })
+            .collect()
+    }
+    #[instrument(skip(self))]
     pub async fn run(&mut self) -> anyhow::Result<()> {
         while let Some(search_item) = self.data_rx.recv().await {
             let client = self.client.clone();
@@ -128,16 +158,16 @@ pub struct DumpData {
 
 #[instrument(
     name = "track_search_task",
-    skip(client),
+    skip(client,status_tx, results_tx),
     fields(
-        query = ?data,
+        query = ?data.track,
     )
 )]
 pub async fn track_search_task(
     client: Arc<soulseek_rs::Client>,
     data: SearchItem,
     status_tx: mpsc::Sender<Status>,
-    results_tx: mpsc::Sender<SearchResult>,
+    results_tx: mpsc::Sender<JudgeSubmission>,
 ) -> anyhow::Result<()> {
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -158,17 +188,14 @@ pub async fn track_search_task(
 
     let mut count = 0;
     'main: loop {
-        if find_history.len() > 5 {
-            cancel.store(true, Ordering::Relaxed);
-            break;
-        };
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
         if !results.is_empty() {
             for result in results.clone() {
-                if !result.files.is_empty() {
+                let submisssions = SearchManager::build_submissions(data.clone(), result);
+                for submission in submisssions {
                     results_tx
-                        .send(result.to_owned())
+                        .send(submission)
                         .await
                         .context("Error sending search result")?
                 }
@@ -178,16 +205,12 @@ pub async fn track_search_task(
         } else {
             count += 1;
         }
-        if count > 1 {
+        if count > 7 {
             tracing::info!(
                 "Exited because one consecutive empty results for: {}",
                 query_string
             );
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            status_tx
-                .send(Status::Done(query_string))
-                .await
-                .context("Issue sending finish signal to main thread")?;
             break 'main;
         }
     }
