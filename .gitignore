@@ -1,0 +1,5 @@
+/target
+.env
+dump_*.txt
+*.log
+rust_files.txt

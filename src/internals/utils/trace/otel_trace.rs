@@ -55,9 +55,11 @@ pub fn init_tracing_with_otel(service_name: String, run_id: String) -> anyhow::R
     let json_layer = fmt::layer()
         .json()
         .with_current_span(true)
+        .with_thread_names(true)
+        .with_level(true)
         .with_span_list(false)
-        .flatten_event(true)
-        .with_span_events(FmtSpan::CLOSE);
+        // .flatten_event(true)
+        .with_span_events(FmtSpan::CLOSE | FmtSpan::ENTER);
 
     // Environment filter
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

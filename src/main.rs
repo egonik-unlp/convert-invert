@@ -1,43 +1,42 @@
 use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use soulseek_rs::{Client, ClientSettings};
-use tokio::{task::JoinHandle, time::sleep};
-use tracing::{Instrument, info_span};
-
 use convert_invert::internals::{
     download::download_manager::DownloadManager,
     judge::judge_manager::{JudgeManager, Levenshtein},
     parsing::deserialize,
     search::search_manager::{SearchItem, SearchManager},
-    utils::trace,
+    utils::{config::config_manager::Config, trace},
 };
+use soulseek_rs::{Client, ClientSettings};
+use tokio::{task::JoinHandle, time::sleep};
+use tracing::{Instrument, info_span, instrument};
 
+#[instrument]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    trace::otel_trace::init_tracing_with_otel(
-        "convert_invert".to_string(),
-        "drop-permit-download".to_string(),
-    )
-    .context("Tracing")?;
+    let config = Config::try_from_env().context("Cannot read env vars for config")?;
+    tracing::info!(config = ?config, "read config");
+    trace::otel_trace::init_tracing_with_otel("convert_invert".to_string(), config.run_id)
+        .context("Tracing")?;
     let data_string = include_str!("./internals/parsing/sample.json");
     let data: deserialize::Playlist = serde_json::from_str(data_string).unwrap();
     let queries: Vec<SearchItem> = data.into();
-    let username = "gonik1994";
     let client_settings = ClientSettings {
-        username: username.to_string(),
-        password: "0112358".to_string(),
-        listen_port: 3513,
+        username: config.user_name.clone(),
+        password: config.user_password,
+        listen_port: config.listen_port,
         ..Default::default()
     };
 
     let download_path =
         PathBuf::from_str("/home/gonik/Music/quinta_falopa").context("Acquiring download dir")?;
+
     let (search_manager, mut download_manager, judge_manager, data_tx) = {
         let mut client = Client::with_settings(client_settings);
         client.connect();
         client.login().context("client login")?;
-        println!("logged in with client: {}", username);
+        println!("logged in with client: {}", config.user_name);
         let client = Arc::new(client);
         let (data_tx, data_rx) = tokio::sync::mpsc::channel(2000);
         let (results_tx, results_rx) = tokio::sync::mpsc::channel(2000);
@@ -67,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("Sending query song")?;
             let elapsed = (chrono::Local::now() - start_time).as_seconds_f32();
-            tracing::warn!("File Sent: {:?}\nHTP = {}", song, elapsed);
+            tracing::warn!(song = ?song, elapsed = elapsed, "File Sent");
             if n % 10 == 0 && n > 1 {
                 sleep(Duration::from_secs(200)).await;
             }

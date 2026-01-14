@@ -15,7 +15,7 @@ use std::{
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::instrument;
+use tracing::{Instrument, info_span, instrument};
 
 const TIMES_WITH_NO_NEW_FILES: usize = 3;
 
@@ -109,25 +109,32 @@ impl SearchManager {
     #[instrument(skip(self))]
     pub async fn run(mut self) -> anyhow::Result<()> {
         let sem = Arc::new(Semaphore::new(2));
+        let span = info_span!("search-task");
         while let Some(search_item) = self.data_rx.recv().await {
-            tracing::debug!("Received search request for: {:?}", search_item.clone());
+            tracing::debug!(
+                track = search_item.clone().track,
+                artist = search_item.clone().artist,
+                "Received search request"
+            );
             let client = self.client.clone();
             let results_tx = self.results_tx.clone();
-            // let name = search_item.clone().track;
             let item = search_item.clone();
             let semaphore = Arc::clone(&sem);
-            let hand = tokio::spawn(async move {
-                let _permit = semaphore
-                    .acquire()
-                    .await
-                    .context("Acquiring Semaphore permit")?;
-                track_search_task(client, item, results_tx)
-                    .await
-                    .context("Track search context")?;
-                Ok(())
-            });
+            let hand = tokio::spawn(
+                async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .context("Acquiring Semaphore permit")?;
+                    track_search_task(client, item, results_tx)
+                        .await
+                        .context("Track search context")?;
+                    Ok(())
+                }
+                .instrument(span.clone()),
+            );
             self.handles.push(hand);
-            tracing::info!("Closed loop for run search");
+            tracing::info!( search_item = ?search_item.clone() ,"Closed loop for run search" );
         }
 
         tracing::info!("Exited while loop for run search");
@@ -173,29 +180,32 @@ pub async fn track_search_task(
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
     let cancel = Arc::new(AtomicBool::new(false));
     let mut find_history: Vec<soulseek_rs::SearchResult> = Vec::new();
+    let span = info_span!("track_blocking");
     let search_thread = {
         let search_client = client.clone();
         let query_string_search = query_string.clone();
         let cancel_search = cancel.clone();
         tokio::task::spawn_blocking(move || {
-            search_client.search_with_cancel(
-                query_string_search.as_str(),
-                Duration::from_secs(100), // Reduced duration for faster exit
-                Some(cancel_search),
-            )
+            {
+                search_client.search_with_cancel(
+                    query_string_search.as_str(),
+                    Duration::from_secs(100), // Reduced duration for faster exit
+                    Some(cancel_search),
+                )
+            }
         })
     };
     let mut previous_submissions = HashSet::new();
     let mut count = 0;
     let mut total_files_found = 0;
     tracing::info!(
-        "About to enter loop for {}, cancel = {:?}",
-        &query_string,
-        cancel
+        string_query = &query_string,
+        cancel = ?cancel,
+        "About to enter search loop",
     );
     #[allow(unused_parens)]
     'main: loop {
-        tracing::info!("First line in loop");
+        tracing::info!("First line in result processing loop");
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
         let results_count: usize = results.iter().map(|res| res.files.len()).sum();
@@ -210,8 +220,11 @@ pub async fn track_search_task(
                         submission.query.filename.clone(),
                         submission.query.username.clone(),
                     )) {
-                        tracing::debug!("Sent submission: {:?}", submission.clone());
-                        tracing::debug!("Submission received with cancel being: {:?}", cancel);
+                        tracing::debug!(submission = ?submission.clone(), "Sent submission");
+                        tracing::debug!(
+                            cancel =?cancel,
+                            "Submission received with cancel being:"
+                        );
                         results_tx
                             .send(submission.clone())
                             .await
@@ -220,8 +233,8 @@ pub async fn track_search_task(
                             .insert((submission.query.filename, submission.query.username));
                     } else {
                         tracing::debug!(
-                            "Rejected entry {:?} because it already was submitted",
-                            submission
+                            submission = ?submission,
+                            "Rejected entry because it already was submitted",
                         );
                     }
                 }
@@ -233,9 +246,9 @@ pub async fn track_search_task(
         }
         if count > TIMES_WITH_NO_NEW_FILES {
             tracing::info!(
-                "Exited because {} consecutive empty results for: {}",
-                TIMES_WITH_NO_NEW_FILES,
-                query_string
+                times = TIMES_WITH_NO_NEW_FILES,
+                query_string = query_string,
+                "Exited because consecutive empty results",
             );
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             break 'main;
