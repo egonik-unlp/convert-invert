@@ -1,3 +1,4 @@
+#![allow(unused)]
 pub struct ParseManager {
     query_playlist: String,
 }

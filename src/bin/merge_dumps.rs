@@ -1,6 +1,7 @@
 use convert_invert::internals::search::search_manager::DumpData;
 use std::{fs::OpenOptions, io::Write};
 
+#[allow(clippy::useless_conversion)]
 fn main() {
     let date = chrono::Local::now().to_string();
     let dumps = std::fs::read_dir(".")

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::internals::search::search_manager::JudgeSubmission;
 use anyhow::{Context, Ok};
 use async_trait::async_trait;
@@ -5,7 +7,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::task::JoinHandle;
-use tracing::{Instrument, instrument};
+use tracing::instrument;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ResponseFormat {
@@ -38,39 +40,49 @@ impl JudgeManager {
         }
     }
     #[instrument(name = "JudgeManager::run2", skip(self))]
-    pub async fn run2(mut self) -> anyhow::Result<()> {
+    pub async fn run2(self) -> anyhow::Result<()> {
         tracing::info!("en fn out j t");
-        let span = tracing::info_span!("judge thread");
-        let judge_thread: JoinHandle<anyhow::Result<()>> = tokio::spawn(
-            async move {
-                while let Some(msg) = self.judge_queue.recv().await {
-                    tracing::info!("received in judge manager = {:?}", msg);
-                    let response = self
-                        .method
-                        .judge(msg.clone())
+        let mut threads = vec![];
+        let JudgeManager {
+            mut judge_queue,
+            download_queue,
+            method,
+        } = self;
+        let method = Arc::new(method);
+        while let Some(msg) = judge_queue.recv().await {
+            let _method = Arc::clone(&method);
+            let download_queue = download_queue.clone();
+            let judge_thread: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                tracing::info!("received in judge manager = {:?}", msg);
+                let response = _method
+                    .judge(msg.clone())
+                    .await
+                    .context("awaiting judge response")?;
+                if response {
+                    download_queue
+                        .clone()
+                        .send(msg.clone())
                         .await
-                        .context("awaiting judge response")?;
-                    if response {
-                        self.download_queue
-                            .send(msg.clone())
-                            .await
-                            .context("Sending passed file")?;
-                        tracing::debug!("Sent to download_queue: {:?}", msg);
-                    }
+                        .context("Sending passed file")?;
+                    tracing::debug!("Sent to download_queue: {:?}", msg);
                 }
                 Ok(())
-            }
-            .instrument(span),
-        );
-        judge_thread
-            .await
-            .context("joining judgre thread")?
-            .context("inner judge")?;
+            });
+            threads.push(judge_thread);
+        }
+        // .instrument(span),
+        for thread in threads {
+            thread
+                .await
+                .context("joining judgre thread")?
+                .context("inner judge")?;
+        }
         tracing::debug!("Judge Thread shutting down");
         Ok(())
     }
 }
 
+#[derive(Clone)]
 pub struct LocalLLM {
     pub address: String,
     pub port: i32,
@@ -121,6 +133,7 @@ impl Judge for LocalLLM {
     }
 }
 
+#[derive(Clone)]
 pub struct Levenshtein {
     pub score_cutoff: f32,
 }

@@ -10,11 +10,24 @@ enum FileFormat {
   aiff,
 }
 
-
 interface SearchItem {
   track: string,
   album: string,
   artist: string
+}
+interface DownloadableFile {
+  filename: string,
+  username: string,
+  size: number
+}
+
+interface Submission {
+  query: SearchItem,
+  track: DownloadableFile,
+}
+interface Response {
+  track: DownloadableFile,
+  score: number
 }
 
 const getSystemPrompt = () => {
@@ -23,18 +36,21 @@ const getSystemPrompt = () => {
 
 const responseFormatScore = z.object({
   score: z.number().max(1).min(0),
-  querySong: z.string(),
-  filename: z.string(),
 })
 type ResponseFormat = z.infer<typeof responseFormatScore>;
+// const agent = createAgent({
+//   model: "openai:gpt-4.1-mini",
+//   tools: [],
+//   systemPrompt: getSystemPrompt(),
+//   responseFormat: responseFormatScore as z.ZodTypeAny,
+// });
+
 const agent = createAgent({
   model: "openai:gpt-4.1-mini",
-  tools: [],
   systemPrompt: getSystemPrompt(),
-  responseFormat: responseFormatScore as z.ZodTypeAny,
 });
 
-async function judge(request): Promise<ResponseFormat> {
+async function judge(request: Submission): Promise<Response> {
   const input = JSON.stringify(request);
   console.log(`input to judge ${JSON.stringify(request)}`)
   const result = await agent.invoke({
@@ -43,9 +59,12 @@ async function judge(request): Promise<ResponseFormat> {
       { role: "user", content: input }
     ]
   })
-  const scores = await result
-  console.log(`\n\n${JSON.stringify(scores)}\n\n`);
-  return scores.structuredResponse as ResponseFormat
+  const inferrence = result.structuredResponse as ResponseFormat;
+  const score = inferrence.score;
+  return {
+    score: score,
+    track: request.track
+  }
 }
 
 const storage = new Map<number, string>();
@@ -57,8 +76,8 @@ Bun.serve({
     "/": new Response("Hola viejiii"),
     "/score":
     {
-      POST: async (request): Promise<ResponseFormat> => {
-        const requestValue = await request.json();
+      POST: async (request): Promise<Response> => {
+        const requestValue: Submission = await request.json();
         const response = await judge(requestValue);
         const timeStamp = Date.now();
         storage.set(Date.now(), JSON.stringify(requestValue));

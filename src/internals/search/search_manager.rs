@@ -1,23 +1,23 @@
 #![allow(unused_labels)]
 
+use crate::internals::parsing::deserialize::Playlist;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::SearchResult;
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     fmt::Display,
     fs::OpenOptions,
     io::Write,
     sync::{Arc, atomic::AtomicBool},
     time::{self, Duration},
 };
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{Instrument, instrument};
+use tracing::instrument;
 
-use crate::internals::parsing::deserialize::Playlist;
-
-const TIMES_WITH_NO_NEW_FILES: usize = 7;
+const TIMES_WITH_NO_NEW_FILES: usize = 1;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
@@ -76,8 +76,7 @@ pub struct SearchManager {
     pub client: Arc<soulseek_rs::Client>,
     pub data_rx: mpsc::Receiver<SearchItem>,
     pub results_tx: mpsc::Sender<JudgeSubmission>,
-    pub handles: HashMap<SearchItem, tokio::task::JoinHandle<anyhow::Result<()>>>,
-    // pub handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    pub handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl SearchManager {
@@ -90,7 +89,7 @@ impl SearchManager {
             client,
             data_rx,
             results_tx,
-            handles: HashMap::new(),
+            handles: vec![],
         }
     }
     fn build_submissions(track: SearchItem, result: SearchResult) -> Vec<JudgeSubmission> {
@@ -108,34 +107,37 @@ impl SearchManager {
             .collect()
     }
     #[instrument(skip(self))]
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        let sem = Arc::new(Semaphore::new(2));
         while let Some(search_item) = self.data_rx.recv().await {
             tracing::debug!("Received search request for: {:?}", search_item.clone());
             let client = self.client.clone();
             let results_tx = self.results_tx.clone();
-            let name = search_item.clone().track;
+            // let name = search_item.clone().track;
             let item = search_item.clone();
-            let span = tracing::info_span!("track-{}", name);
-            let handle = tokio::spawn(
-                async move {
-                    track_search_task(client, item, results_tx)
-                        .await
-                        .context("Track search context")?;
-                    Ok(())
-                }
-                .instrument(span),
-            );
-            self.handles.insert(search_item.clone(), handle);
+            let semaphore = Arc::clone(&sem);
+            let hand = tokio::spawn(async move {
+                let _permit = semaphore
+                    .acquire()
+                    .await
+                    .context("Acquiring Semaphore permit")?;
+                track_search_task(client, item, results_tx)
+                    .await
+                    .context("Track search context")?;
+                // .instrument(span),
+                // );
+                Ok(())
+            });
+            self.handles.push(hand);
             tracing::info!("Closed loop for run search");
         }
 
-        tracing::info!("Excited while loop for run search");
-        for (file, handle) in self.handles.drain() {
-            tracing::debug!("Joining thread for {} - {}", file.track, file.artist);
+        tracing::info!("Exited while loop for run search");
+        for handle in self.handles {
             handle
                 .await
                 .context("Search thread error")?
-                .context("inner error")?;
+                .context("inner error")?
         }
         Ok(())
     }
@@ -179,32 +181,53 @@ pub async fn track_search_task(
         tokio::task::spawn_blocking(move || {
             search_client.search_with_cancel(
                 query_string_search.as_str(),
-                Duration::from_secs(1000), // Reduced duration for faster exit
+                Duration::from_secs(100), // Reduced duration for faster exit
                 Some(cancel_search),
             )
         })
     };
-
+    let mut previous_submissions = HashSet::new();
     let mut count = 0;
     let mut total_files_found = 0;
+    tracing::info!(
+        "About to enter loop for {}, cancel = {:?}",
+        &query_string,
+        cancel
+    );
     #[allow(unused_parens)]
     'main: loop {
+        tracing::info!("First line in loop");
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
         let results_count: usize = results.iter().map(|res| res.files.len()).sum();
+        tracing::info!("In infinite loop for {}", &query_string);
         if !results.is_empty() && !total_files_found.eq(&results_count) {
             find_history.extend(results.clone());
             total_files_found += (results_count - total_files_found);
             for result in results {
                 let submisssions = SearchManager::build_submissions(data.clone(), result);
                 for submission in submisssions {
-                    tracing::debug!("Sent submission: {:?}", submission.clone());
-                    results_tx
-                        .send(submission)
-                        .await
-                        .context("Error sending search result")?
+                    if !previous_submissions.contains(&(
+                        submission.query.filename.clone(),
+                        submission.query.username.clone(),
+                    )) {
+                        tracing::debug!("Sent submission: {:?}", submission.clone());
+                        tracing::debug!("Submission received with cancel being: {:?}", cancel);
+                        results_tx
+                            .send(submission.clone())
+                            .await
+                            .context("Error sending search result")?;
+                        previous_submissions
+                            .insert((submission.query.filename, submission.query.username));
+                    } else {
+                        tracing::debug!(
+                            "Rejected entry {:?} because it already was submitted",
+                            submission
+                        );
+                    }
                 }
             }
+            count = 0;
             dump_data_logging(data.clone(), find_history.clone()).context("dumping")?;
         } else {
             count += 1;
@@ -223,6 +246,7 @@ pub async fn track_search_task(
         .await
         .unwrap()
         .context("Inner search thread issue")?;
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

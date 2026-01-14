@@ -1,7 +1,7 @@
 use anyhow::Context;
 use convert_invert::internals::download::download_manager::DownloadManager;
 use convert_invert::internals::judge::judge_manager::{JudgeManager, Levenshtein};
-use convert_invert::internals::utils::trace;
+// use convert_invert::internals::utils::trace;
 use convert_invert::internals::{
     parsing::deserialize,
     search::search_manager::{SearchItem, SearchManager},
@@ -41,25 +41,25 @@ async fn main() -> anyhow::Result<()> {
     let data_string = include_str!("./internals/parsing/sample.json");
     let data: deserialize::Playlist = serde_json::from_str(data_string).unwrap();
     let queries: Vec<SearchItem> = data.into();
-    let username = "egon1994";
+    let username = "ego1994";
     let client_settings = ClientSettings {
         username: username.to_string(),
         password: "0112358".to_string(),
-        listen_port: 3217,
+        listen_port: 3216,
         ..Default::default()
     };
 
     let download_path =
         PathBuf::from_str("/home/gonik/Music/tercera_falopa").context("Acquiring download dir")?;
-    let (mut search_manager, mut download_manager, judge_manager, data_tx) = {
+    let (search_manager, mut download_manager, judge_manager, data_tx) = {
         let mut client = Client::with_settings(client_settings);
         client.connect();
         client.login().context("client login")?;
         println!("logged in with client: {}", username);
         let client = Arc::new(client);
         let (data_tx, data_rx) = tokio::sync::mpsc::channel(100);
-        let (results_tx, results_rx) = tokio::sync::mpsc::channel(100);
-        let (download_tx, download_rx) = tokio::sync::mpsc::channel(100);
+        let (results_tx, results_rx) = tokio::sync::mpsc::channel(1000);
+        let (download_tx, download_rx) = tokio::sync::mpsc::channel(1000);
         let search_manager = SearchManager::new(client.clone(), data_rx, results_tx);
 
         let lev_judge = Levenshtein::new(0.75);
@@ -73,14 +73,14 @@ async fn main() -> anyhow::Result<()> {
     let download_thread = tokio::spawn(async move { download_manager.run().await });
 
     let start_time = chrono::Local::now();
-    for (n, song) in queries.into_iter().skip(40).enumerate() {
+    for (n, song) in queries.into_iter().skip(4).enumerate() {
         data_tx
             .send(song.clone())
             .await
             .context("Sending query song")?;
         let elapsed = (chrono::Local::now() - start_time).as_seconds_f32();
         tracing::warn!("File Sent: {:?}\nHTP = {}", song, elapsed);
-        if n % 10 == 0 {
+        if n % 10 == 0 && n > 1 {
             sleep(Duration::from_secs(90)).await;
         }
     }
@@ -95,8 +95,7 @@ async fn main() -> anyhow::Result<()> {
         .context("inner")?;
     search_thread
         .await
-        .context("Joining search thread")?
-        .context("inner search")?;
-    // trace::otel_trace::shutdown_otel();
+        .context("Search thread joining")?
+        .context("inner")?;
     Ok(())
 }
