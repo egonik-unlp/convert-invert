@@ -3,3 +3,5 @@
 dump_*.txt
 *.log
 rust_files.txt
+dumps/
+.vscode/

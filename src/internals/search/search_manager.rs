@@ -194,7 +194,8 @@ pub async fn track_search_task(
                 )
             }
         })
-    };
+    }
+    .instrument(span);
     let mut previous_submissions = HashSet::new();
     let mut count = 0;
     let mut total_files_found = 0;
