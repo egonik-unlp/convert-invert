@@ -39,9 +39,8 @@ impl JudgeManager {
             method,
         }
     }
-    #[instrument(name = "JudgeManager::run2", skip(self))]
-    pub async fn run2(self) -> anyhow::Result<()> {
-        tracing::info!("en fn out j t");
+    #[instrument(name = "JudgeManager::run", skip(self))]
+    pub async fn run(self) -> anyhow::Result<()> {
         let mut threads = vec![];
         let JudgeManager {
             mut judge_queue,

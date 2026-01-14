@@ -15,10 +15,10 @@ use tracing_subscriber::{
 
 /// Initialize tracing with OpenTelemetry integration
 /// This enables trace correlation in logs
-pub fn init_tracing_with_otel(service_name: String) -> anyhow::Result<()> {
-    // Create resource attributes
+pub fn init_tracing_with_otel(service_name: String, run_id: String) -> anyhow::Result<()> {
     let resource = Resource::new(vec![
         opentelemetry::KeyValue::new(SERVICE_NAME, service_name.clone()),
+        opentelemetry::KeyValue::new("RUN_ID", run_id),
         opentelemetry::KeyValue::new(
             SERVICE_VERSION,
             std::env::var("SERVICE_VERSION").unwrap_or_else(|_| "1.0.0".to_string()),

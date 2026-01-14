@@ -1,8 +1,11 @@
 use crate::internals::search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem};
 use anyhow::Context;
 use soulseek_rs::{Client, DownloadStatus, SearchResult};
-use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::Arc};
-use tokio::{sync::mpsc, task::JoinHandle};
+use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+};
 use tracing::instrument;
 
 fn is_audio_file(filename: String) -> bool {
@@ -88,6 +91,7 @@ impl DownloadManager {
                 .context("Joining download thread")?
                 .context("inner")?;
         }
+        tracing::info!("Download thread shutting down");
         Ok(())
     }
 }
@@ -96,15 +100,21 @@ fn has_been_downloaded(track: &SearchItem, tracks: &HashSet<SearchItem>) -> bool
     tracks.contains(track)
 }
 
-#[tracing::instrument(name = "DownloadManager::download_track", skip(song, path, client))]
+#[tracing::instrument(name = "DownloadManager::download_track", skip(song, path, client), fields(
+    song_name = song.filename,
+    user_name = song.username,
+))]
 async fn download_track(
     song: DownloadableFile,
     path: PathBuf,
     client: Arc<Client>,
 ) -> anyhow::Result<()> {
+    let sem = Arc::new(Semaphore::new(1));
     let song_path = PathBuf::from_str(&song.filename).context("Can't parse filename")?;
     let path = path.join(song_path.file_name().context("Cannot create file")?);
     let path_str = path.as_path().to_str().context("Non valid path")?;
+    let semaphore = Arc::clone(&sem);
+    let permit = semaphore.acquire().await.context("Getting permit")?;
     match client.download(
         song.filename.clone(),
         song.username,
@@ -112,10 +122,18 @@ async fn download_track(
         path_str.to_string(),
     ) {
         Ok(rec) => {
-            let span = tracing::info_span!("download_thread");
+            let span = tracing::info_span!("download_thread_inner");
             let download_handle = tokio::task::spawn_blocking(move || {
+                let mut notified_tracks = HashSet::new();
                 span.in_scope(|| {
-                    while let Ok(status) = rec.recv() {
+                    while let Ok(status) = rec.recv_timeout(Duration::from_secs(60)) {
+                        if let DownloadStatus::Queued = status
+                            && !notified_tracks.contains(&song.filename)
+                        {
+                            let track = song.filename.clone();
+                            notified_tracks.insert(track.clone());
+                            tracing::info!("Encolado {}", track);
+                        }
                         if let DownloadStatus::Completed = status {
                             tracing::info!("completado {}", song.filename.clone());
                             break;
@@ -143,9 +161,9 @@ async fn download_track(
                     tracing::info!("Reached ending of blocking thread")
                 });
             });
-            tracing::info!("Pre await download handle");
             download_handle.await.context("Download thread down")?;
-            tracing::info!("Post await download handle");
+            tracing::info!("Ending download loop");
+            drop(permit);
         }
         Err(error) => tracing::error!("Error en descarga {}", error),
     }

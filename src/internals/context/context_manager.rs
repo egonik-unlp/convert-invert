@@ -20,3 +20,6 @@ pub enum Track {
     Downloadable(DownloadableFile),
     File(DownloadedFile),
 }
+pub trait Manager {
+    fn run(self) -> anyhow::Result<()>;
+}

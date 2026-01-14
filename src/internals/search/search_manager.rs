@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::instrument;
 
-const TIMES_WITH_NO_NEW_FILES: usize = 1;
+const TIMES_WITH_NO_NEW_FILES: usize = 3;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
@@ -124,8 +124,6 @@ impl SearchManager {
                 track_search_task(client, item, results_tx)
                     .await
                     .context("Track search context")?;
-                // .instrument(span),
-                // );
                 Ok(())
             });
             self.handles.push(hand);
@@ -139,6 +137,7 @@ impl SearchManager {
                 .context("Search thread error")?
                 .context("inner error")?
         }
+        tracing::info!("Search thread shutting down");
         Ok(())
     }
 }
