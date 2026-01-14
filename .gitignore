@@ -5,3 +5,5 @@ dump_*.txt
 rust_files.txt
 dumps/
 .vscode/
+*dump*
+.nvimlog
