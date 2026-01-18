@@ -1,6 +1,8 @@
 #![allow(unused, dead_code)]
-use crate::internals::{parsing::deserialize, search::search_manager::SearchItem};
-use anyhow::Context;
+use crate::internals::{
+    context::context_manager::Track, parsing::deserialize, search::search_manager::SearchItem,
+};
+use anyhow::{Context, Result};
 use std::time::Duration;
 use tokio::{sync::mpsc::Sender, time::sleep};
 
@@ -20,7 +22,7 @@ impl QueryManager {
     async fn get_playlist_from_spotify(&self) -> anyhow::Result<()> {
         todo!()
     }
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run_channel(self) -> anyhow::Result<()> {
         let data_string = include_str!("../parsing/sample.json");
         let data: deserialize::Playlist = serde_json::from_str(data_string).unwrap();
         let queries: Vec<SearchItem> = data.into();
@@ -37,5 +39,13 @@ impl QueryManager {
             }
         }
         Ok(())
+    }
+
+    pub async fn run(self) -> anyhow::Result<Track> {
+        let data_string = include_str!("../parsing/sample.json");
+        let data: deserialize::Playlist =
+            serde_json::from_str(data_string).context("Deserializing")?;
+        let queries: Vec<SearchItem> = data.into();
+        Ok(Track::Query(queries))
     }
 }

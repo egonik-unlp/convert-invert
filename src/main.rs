@@ -35,16 +35,22 @@ async fn main() -> anyhow::Result<()> {
         let mut client = Client::with_settings(client_settings);
         client.connect();
         client.login().context("client login")?;
-        tracing::info!(user_name = config.user_name, "Logged in");
         let client = Arc::new(client);
+
+        tracing::info!(user_name = config.user_name, "Logged in");
+
         let (data_tx, data_rx) = tokio::sync::mpsc::channel(2000);
         let (results_tx, results_rx) = tokio::sync::mpsc::channel(2000);
         let (download_tx, download_rx) = tokio::sync::mpsc::channel(2000);
+
         let search_manager = SearchManager::new(client.clone(), data_rx, results_tx);
 
-        let lev_judge = Levenshtein::new(0.75);
+        let lev_score = config.judge_score_levenshtein.unwrap_or(0.75);
+        let lev_judge = Levenshtein::new(lev_score);
         let judge_manager = JudgeManager::new(results_rx, download_tx, Box::new(lev_judge));
+
         let download_manager = DownloadManager::new(client.clone(), download_path, download_rx);
+
         let query_manager = QueryManager::new("", data_tx);
         (
             search_manager,
@@ -58,14 +64,15 @@ async fn main() -> anyhow::Result<()> {
     let judge_span = info_span!("judge_thread");
     let download_span = info_span!("download_thread");
     let query_span = info_span!("query_thread");
+
     let search_thread =
-        tokio::spawn(async move { search_manager.run().await }.instrument(search_span));
+        tokio::spawn(async move { search_manager.run_channel().await }.instrument(search_span));
     let judge_thread =
-        tokio::spawn(async move { judge_manager.run().await }.instrument(judge_span));
+        tokio::spawn(async move { judge_manager.run_channel().await }.instrument(judge_span));
     let download_thread =
-        tokio::spawn(async move { download_manager.run().await }.instrument(download_span));
+        tokio::spawn(async move { download_manager.run_channel().await }.instrument(download_span));
     let query_thread =
-        tokio::spawn(async move { query_manager.run().await }.instrument(query_span));
+        tokio::spawn(async move { query_manager.run_channel().await }.instrument(query_span));
 
     query_thread
         .await

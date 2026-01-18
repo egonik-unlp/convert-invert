@@ -1,8 +1,8 @@
 [package]
-name = "convert_invert"
+name = "convert-invert"
 version = "0.1.0"
 edition = "2024"
-default-run = "convert_invert"
+default-run = "convert-invert"
 
 [lib]
 path = "./src/lib.rs"
@@ -26,12 +26,11 @@ tracing-subscriber = { version = "0.3.22", features = [
   "json",
   "fmt",
 ] }
-tracing-opentelemetry = "0.25"
-opentelemetry = "0.24"
-opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
-opentelemetry-otlp = "0.17"
 opentelemetry-semantic-conventions = "0.31.0"
 spotify-rs = "0.4.1"
 uuid = "1.19.0"
 dotenvy = "0.15.7"
-src = "0.0.6"
+tracing-opentelemetry = "0.25"
+opentelemetry = "0.24"
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.17"
