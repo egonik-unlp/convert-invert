@@ -43,7 +43,7 @@ impl JudgeManager {
         }
     }
     #[instrument(name = "JudgeManager::run", skip(self))]
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run_channel(self) -> anyhow::Result<()> {
         let mut threads = vec![];
         let JudgeManager {
             mut judge_queue,
@@ -81,6 +81,9 @@ impl JudgeManager {
         }
         tracing::debug!("Judge Thread shutting down");
         Ok(())
+    }
+    pub async fn run(self, track: JudgeSubmission) -> Result<Track> {
+        todo!()
     }
 }
 
@@ -147,7 +150,7 @@ impl Levenshtein {
 
 #[async_trait]
 impl Judge for Levenshtein {
-    #[instrument(name = "Levenshtein::judge", skip(self, submission), fields(username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
+    #[instrument(name = "Levenshtein::judge", skip(self, submission), fields(id=submission.track.id,username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
     async fn judge(&self, submission: JudgeSubmission) -> anyhow::Result<bool> {
         let distance = str_distance::Levenshtein::default();
         let a = format!("{}", submission.track);
@@ -157,7 +160,7 @@ impl Judge for Levenshtein {
         let val = distance_val > self.score_cutoff as f64;
         Ok(val)
     }
-    #[instrument(name = "Levenshtein::judge_score", skip(self,submission), fields(username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
+    #[instrument(name = "Levenshtein::judge_score", skip(self,submission), fields(id=submission.track.id,username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
     async fn judge_score(&self, submission: JudgeSubmission) -> anyhow::Result<f32> {
         let distance = str_distance::Levenshtein::default();
         let a = format!("{}", submission.track);

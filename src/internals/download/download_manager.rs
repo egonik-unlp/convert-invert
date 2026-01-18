@@ -1,4 +1,7 @@
-use crate::internals::search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem};
+use crate::internals::{
+    context::context_manager::Track,
+    search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem},
+};
 use anyhow::Context;
 use soulseek_rs::{Client, DownloadStatus, SearchResult};
 use std::{collections::HashSet, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
@@ -6,7 +9,7 @@ use tokio::{
     sync::{Semaphore, mpsc},
     task::JoinHandle,
 };
-use tracing::instrument;
+use tracing::{Instrument, info_span, instrument};
 
 fn is_audio_file(filename: String) -> bool {
     let lc = filename.to_lowercase();
@@ -56,10 +59,11 @@ impl DownloadManager {
             download_queue,
         }
     }
-    #[instrument(name = "DownloadManager::run", skip(self))]
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    #[instrument(name = "DownloadManager::run_channel", skip(self))]
+    pub async fn run_channel(&mut self) -> anyhow::Result<()> {
         let mut downloaded_files = HashSet::new();
         let mut threads = vec![];
+        let span = info_span!("download-blocking-thread-spawner");
         while let Some(song) = self.download_queue.recv().await {
             tracing::debug!("Started loop for {:?}", song.clone());
             let _othersong = song.clone();
@@ -69,12 +73,15 @@ impl DownloadManager {
                 && !has_been_downloaded(&song.track, &downloaded_files)
             {
                 downloaded_files.insert(song.track.clone());
-                let thread: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                    download_track(song.query, download_location.clone(), client)
-                        .await
-                        .context("Downloading track")?;
-                    Ok(())
-                });
+                let thread: JoinHandle<anyhow::Result<()>> = tokio::spawn(
+                    async move {
+                        download_track(song, download_location.clone(), client)
+                            .await
+                            .context("Downloading track")?;
+                        Ok(())
+                    }
+                    .instrument(span.clone()),
+                );
                 threads.push(thread);
                 tracing::info!("After download track in run");
             } else {
@@ -94,6 +101,9 @@ impl DownloadManager {
         tracing::info!("Download thread shutting down");
         Ok(())
     }
+    pub async fn run(self, track: JudgeSubmission) -> anyhow::Result<Track> {
+        todo!()
+    }
 }
 
 fn has_been_downloaded(track: &SearchItem, tracks: &HashSet<SearchItem>) -> bool {
@@ -101,11 +111,12 @@ fn has_been_downloaded(track: &SearchItem, tracks: &HashSet<SearchItem>) -> bool
 }
 
 #[tracing::instrument(name = "DownloadManager::download_track", skip(song, path, client), fields(
-    song_name = song.filename,
-    user_name = song.username,
+    id = song.track.id,
+    song_name = song.query.filename,
+    user_name = song.query.username,
 ))]
 async fn download_track(
-    song: DownloadableFile,
+    song: JudgeSubmission,
     path: PathBuf,
     client: Arc<Client>,
 ) -> anyhow::Result<()> {
@@ -116,9 +127,9 @@ async fn download_track(
     let semaphore = Arc::clone(&sem);
     let permit = semaphore.acquire().await.context("Getting permit")?;
     match client.download(
-        song.filename.clone(),
-        song.username,
-        song.size,
+        song.query.filename.clone(),
+        song.query.username,
+        song.query.size,
         path_str.to_string(),
     ) {
         Ok(rec) => {
@@ -128,18 +139,18 @@ async fn download_track(
                 span.in_scope(|| {
                     while let Ok(status) = rec.recv_timeout(Duration::from_secs(60)) {
                         if let DownloadStatus::Queued = status
-                            && !notified_tracks.contains(&song.filename)
+                            && !notified_tracks.contains(&song.query.filename)
                         {
-                            let track = song.filename.clone();
+                            let track = song.query.filename.clone();
                             notified_tracks.insert(track.clone());
                             tracing::info!("Encolado {}", track);
                         }
                         if let DownloadStatus::Completed = status {
-                            tracing::info!("completado {}", song.filename.clone());
+                            tracing::info!("completado {}", song.query.filename.clone());
                             break;
                         }
                         if let DownloadStatus::Failed | DownloadStatus::TimedOut = status {
-                            tracing::info!("fallado {}", song.filename.clone());
+                            tracing::info!("fallado {}", song.query.filename.clone());
                             break;
                         }
                         if let DownloadStatus::InProgress {
@@ -154,7 +165,7 @@ async fn download_track(
                                 bytes_downloaded,
                                 total_bytes,
                                 speed_bytes_per_sec,
-                                song.filename
+                                song.query.filename
                             )
                         }
                     }

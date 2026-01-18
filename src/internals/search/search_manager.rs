@@ -1,38 +1,58 @@
 #![allow(unused_labels)]
 
 use crate::internals::parsing::deserialize::Playlist;
-use anyhow::Context;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use soulseek_rs::SearchResult;
 use std::{
     collections::HashSet,
     fmt::Display,
     fs::OpenOptions,
+    hash::{DefaultHasher, Hash, Hasher},
     io::Write,
     sync::{Arc, atomic::AtomicBool},
     time::{self, Duration},
 };
-use tokio::sync::Semaphore;
-use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::{
+    sync::{Semaphore, mpsc},
+    time::sleep,
+};
 use tracing::{Instrument, info_span, instrument};
 
 const TIMES_WITH_NO_NEW_FILES: usize = 3;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
+    pub id: u64,
     pub track: String,
     pub album: String,
     pub artist: String,
+}
+impl SearchItem {
+    fn new(track: String, album: String, artist: String) -> Self {
+        let id = {
+            let mut s = DefaultHasher::new();
+            track.hash(&mut s);
+            album.hash(&mut s);
+            artist.hash(&mut s);
+            s.finish()
+        };
+        SearchItem {
+            id,
+            track,
+            album,
+            artist,
+        }
+    }
 }
 impl From<Playlist> for Vec<SearchItem> {
     fn from(value: Playlist) -> Vec<SearchItem> {
         let tracks = value.tracks.unwrap().items.unwrap();
         tracks
             .into_iter()
-            .map(|tr| SearchItem {
-                track: tr.clone().track.unwrap().name.unwrap(),
-                artist: tr
+            .map(|tr| {
+                let track = tr.clone().track.unwrap().name.unwrap();
+                let artist = tr
                     .track
                     .clone()
                     .unwrap()
@@ -43,8 +63,9 @@ impl From<Playlist> for Vec<SearchItem> {
                     .name
                     .clone()
                     .unwrap()
-                    .clone(),
-                album: tr.track.unwrap().album.unwrap().name.unwrap(),
+                    .clone();
+                let album = tr.track.unwrap().album.unwrap().name.unwrap();
+                SearchItem::new(track, album, artist)
             })
             .collect()
     }
@@ -107,7 +128,7 @@ impl SearchManager {
             .collect()
     }
     #[instrument(skip(self))]
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run_channel(mut self) -> anyhow::Result<()> {
         let sem = Arc::new(Semaphore::new(2));
         let span = info_span!("search-task");
         while let Some(search_item) = self.data_rx.recv().await {
@@ -147,6 +168,9 @@ impl SearchManager {
         tracing::info!("Search thread shutting down");
         Ok(())
     }
+    pub async fn run(self, track: SearchItem) -> anyhow::Result<()> {
+        todo!()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -169,6 +193,7 @@ pub struct DumpData {
     name = "track_search_task",
     skip(client, results_tx),
     fields(
+        id = data.id,
         query = ?data.track,
     )
 )]
