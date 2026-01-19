@@ -14,6 +14,15 @@ pub struct Config {
     pub judge_score_llm: Option<f32>,
     pub listen_port: u32,
     pub search_timeout_secs: u8,
+    pub max_search_timeout_secs: u64,
+    pub max_search_retries: u8,
+    pub max_judge_retries: u8,
+    pub max_download_retries: u8,
+    pub base_backoff_secs: u64,
+    pub max_backoff_secs: u64,
+    pub max_concurrent_searches: usize,
+    pub max_concurrent_judges: usize,
+    pub max_concurrent_downloads: usize,
 }
 
 impl Config {
@@ -40,6 +49,42 @@ impl Config {
             let val = env::var("SEARCH_TIMEOUT_SECS").unwrap_or("10".to_string());
             val.parse().context("cannot parse val")?
         };
+        let max_search_timeout_secs: u64 = {
+            let val = env::var("MAX_SEARCH_TIMEOUT_SECS").unwrap_or("120".to_string());
+            val.parse().context("cannot parse max search timeout")?
+        };
+        let max_search_retries: u8 = {
+            let val = env::var("MAX_SEARCH_RETRIES").unwrap_or("2".to_string());
+            val.parse().context("cannot parse max search retries")?
+        };
+        let max_judge_retries: u8 = {
+            let val = env::var("MAX_JUDGE_RETRIES").unwrap_or("2".to_string());
+            val.parse().context("cannot parse max judge retries")?
+        };
+        let max_download_retries: u8 = {
+            let val = env::var("MAX_DOWNLOAD_RETRIES").unwrap_or("2".to_string());
+            val.parse().context("cannot parse max download retries")?
+        };
+        let base_backoff_secs: u64 = {
+            let val = env::var("BASE_BACKOFF_SECS").unwrap_or("5".to_string());
+            val.parse().context("cannot parse base backoff secs")?
+        };
+        let max_backoff_secs: u64 = {
+            let val = env::var("MAX_BACKOFF_SECS").unwrap_or("60".to_string());
+            val.parse().context("cannot parse max backoff secs")?
+        };
+        let max_concurrent_searches: usize = {
+            let val = env::var("MAX_CONCURRENT_SEARCHES").unwrap_or("4".to_string());
+            val.parse().context("cannot parse max concurrent searches")?
+        };
+        let max_concurrent_judges: usize = {
+            let val = env::var("MAX_CONCURRENT_JUDGES").unwrap_or("8".to_string());
+            val.parse().context("cannot parse max concurrent judges")?
+        };
+        let max_concurrent_downloads: usize = {
+            let val = env::var("MAX_CONCURRENT_DOWNLOADS").unwrap_or("2".to_string());
+            val.parse().context("cannot parse max concurrent downloads")?
+        };
         Ok(Config {
             run_id,
             log_level,
@@ -49,6 +94,15 @@ impl Config {
             judge_score_llm,
             listen_port,
             search_timeout_secs,
+            max_search_timeout_secs,
+            max_search_retries,
+            max_judge_retries,
+            max_download_retries,
+            base_backoff_secs,
+            max_backoff_secs,
+            max_concurrent_searches,
+            max_concurrent_judges,
+            max_concurrent_downloads,
         })
     }
 
@@ -61,6 +115,15 @@ impl Config {
         judge_score_llm: Option<f32>,
         listen_port: u32,
         search_timeout_secs: u8,
+        max_search_timeout_secs: u64,
+        max_search_retries: u8,
+        max_judge_retries: u8,
+        max_download_retries: u8,
+        base_backoff_secs: u64,
+        max_backoff_secs: u64,
+        max_concurrent_searches: usize,
+        max_concurrent_judges: usize,
+        max_concurrent_downloads: usize,
         run_id: String,
     ) -> Self {
         Config {
@@ -72,6 +135,15 @@ impl Config {
             judge_score_llm,
             listen_port,
             search_timeout_secs,
+            max_search_timeout_secs,
+            max_search_retries,
+            max_judge_retries,
+            max_download_retries,
+            base_backoff_secs,
+            max_backoff_secs,
+            max_concurrent_searches,
+            max_concurrent_judges,
+            max_concurrent_downloads,
         }
     }
 }

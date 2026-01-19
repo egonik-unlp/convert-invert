@@ -1,7 +1,10 @@
 #![allow(unused_labels)]
 
-use crate::internals::parsing::deserialize::Playlist;
-use anyhow::{Context, Result};
+use crate::internals::{
+    context::context_manager::{SearchRequest, SearchResults},
+    parsing::deserialize::Playlist,
+};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::SearchResult;
 use std::{
@@ -20,6 +23,7 @@ use tokio::{
 use tracing::{Instrument, info_span, instrument};
 
 const TIMES_WITH_NO_NEW_FILES: usize = 3;
+const DEFAULT_SEARCH_TIMEOUT_SECS: u64 = 100;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
@@ -113,6 +117,19 @@ impl SearchManager {
             handles: vec![],
         }
     }
+    pub fn new_context(client: Arc<soulseek_rs::Client>) -> Self {
+        let (_data_tx, data_rx) = mpsc::channel(1);
+        let (results_tx, _results_rx) = mpsc::channel(1);
+        SearchManager {
+            client,
+            data_rx,
+            results_tx,
+            handles: vec![],
+        }
+    }
+    pub fn context_clone(&self) -> Self {
+        SearchManager::new_context(self.client.clone())
+    }
     fn build_submissions(track: SearchItem, result: SearchResult) -> Vec<JudgeSubmission> {
         result
             .files
@@ -147,7 +164,7 @@ impl SearchManager {
                         .acquire()
                         .await
                         .context("Acquiring Semaphore permit")?;
-                    track_search_task(client, item, results_tx)
+                    track_search_task(client, item, results_tx, DEFAULT_SEARCH_TIMEOUT_SECS)
                         .await
                         .context("Track search context")?;
                     Ok(())
@@ -168,8 +185,27 @@ impl SearchManager {
         tracing::info!("Search thread shutting down");
         Ok(())
     }
-    pub async fn run(self, track: SearchItem) -> anyhow::Result<()> {
-        todo!()
+    pub async fn run(&self, request: SearchRequest) -> anyhow::Result<SearchResults> {
+        let (results_tx, mut results_rx) = mpsc::channel(2000);
+        let client = self.client.clone();
+        let track_clone = request.item.clone();
+        let timeout_secs = request.timeout_secs;
+        let handle = tokio::spawn(async move {
+            track_search_task(client, track_clone, results_tx, timeout_secs)
+                .await
+                .context("Track search task")
+        });
+
+        let mut submissions = Vec::new();
+        while let Some(submission) = results_rx.recv().await {
+            submissions.push(submission);
+        }
+
+        handle.await.context("Search task join")??;
+        Ok(SearchResults {
+            request,
+            submissions,
+        })
     }
 }
 
@@ -201,6 +237,7 @@ pub async fn track_search_task(
     client: Arc<soulseek_rs::Client>,
     data: SearchItem,
     results_tx: mpsc::Sender<JudgeSubmission>,
+    timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -214,7 +251,7 @@ pub async fn track_search_task(
             {
                 search_client.search_with_cancel(
                     query_string_search.as_str(),
-                    Duration::from_secs(100), // Reduced duration for faster exit
+                    Duration::from_secs(timeout_secs),
                     Some(cancel_search),
                 )
             }
@@ -231,12 +268,18 @@ pub async fn track_search_task(
     );
     #[allow(unused_parens)]
     'main: loop {
-        tracing::info!("First line in result processing loop");
+        tracing::debug!("First line in result processing loop");
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
         let results_count: usize = results.iter().map(|res| res.files.len()).sum();
-        tracing::info!("In infinite loop for {}", &query_string);
+        tracing::debug!("In infinite loop for {}", &query_string);
         if !results.is_empty() && !total_files_found.eq(&results_count) {
+            tracing::info!(
+                query = %query_string,
+                new_results = results_count.saturating_sub(total_files_found),
+                total_results = results_count,
+                "New search results"
+            );
             find_history.extend(results.clone());
             total_files_found += (results_count - total_files_found);
             for result in results {
@@ -247,10 +290,7 @@ pub async fn track_search_task(
                         submission.query.username.clone(),
                     )) {
                         tracing::debug!(submission = ?submission.clone(), "Sent submission");
-                        tracing::debug!(
-                            cancel =?cancel,
-                            "Submission received with cancel being:"
-                        );
+                        tracing::debug!(cancel =?cancel, "Submission received");
                         results_tx
                             .send(submission.clone())
                             .await

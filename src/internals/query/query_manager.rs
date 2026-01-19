@@ -4,7 +4,10 @@ use crate::internals::{
 };
 use anyhow::{Context, Result};
 use std::time::Duration;
-use tokio::{sync::mpsc::Sender, time::sleep};
+use tokio::{
+    sync::mpsc::{self, Sender},
+    time::sleep,
+};
 
 pub struct QueryManager {
     playlist_url: String,
@@ -18,6 +21,10 @@ impl QueryManager {
             playlist_url,
             data_tx,
         }
+    }
+    pub fn new_context(playlist_url: impl Into<String>) -> Self {
+        let (data_tx, _data_rx) = mpsc::channel(1);
+        QueryManager::new(playlist_url, data_tx)
     }
     async fn get_playlist_from_spotify(&self) -> anyhow::Result<()> {
         todo!()
@@ -41,11 +48,26 @@ impl QueryManager {
         Ok(())
     }
 
-    pub async fn run(self) -> anyhow::Result<Track> {
+    pub async fn run(&self) -> anyhow::Result<Track> {
         let data_string = include_str!("../parsing/sample.json");
         let data: deserialize::Playlist =
             serde_json::from_str(data_string).context("Deserializing")?;
         let queries: Vec<SearchItem> = data.into();
         Ok(Track::Query(queries))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_returns_queries() {
+        let manager = QueryManager::new_context("");
+        let track = manager.run().await.expect("run");
+        match track {
+            Track::Query(items) => assert!(!items.is_empty()),
+            _ => panic!("expected Track::Query"),
+        }
     }
 }
