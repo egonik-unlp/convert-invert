@@ -48,7 +48,7 @@ impl QueryManager {
         Ok(())
     }
 
-    pub async fn run(&self) -> anyhow::Result<Track> {
+    pub async fn run(self) -> anyhow::Result<Track> {
         let data_string = include_str!("../parsing/sample.json");
         let data: deserialize::Playlist =
             serde_json::from_str(data_string).context("Deserializing")?;
