@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
-use crate::internals::search::search_manager::JudgeSubmission;
-use anyhow::{Context, Ok};
+use anyhow::Context;
 use async_trait::async_trait;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    task::JoinHandle,
+};
 use tracing::instrument;
+
+use crate::internals::search::search_manager::JudgeSubmission;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ResponseFormat {
@@ -49,11 +52,11 @@ impl JudgeManager {
         } = self;
         let method = Arc::new(method);
         while let Some(msg) = judge_queue.recv().await {
-            let _method = Arc::clone(&method);
+            let method = Arc::clone(&method);
             let download_queue = download_queue.clone();
             let judge_thread: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                 tracing::info!("received in judge manager = {:?}", msg);
-                let response = _method
+                let response = method
                     .judge(msg.clone())
                     .await
                     .context("awaiting judge response")?;

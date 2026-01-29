@@ -15,8 +15,13 @@ use convert_invert::internals::{
 #[instrument]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config = Config::try_from_env().context("Cannot read env vars for config")?;
-
+    let mut config = Config::try_from_env().context("Cannot read env vars for config")?;
+    let attempt_num: usize = match std::env::args().nth(1) {
+        Some(value) => value.parse().unwrap(),
+        None => 1usize,
+    };
+    config.run_id = format!("{}_attempt_{}", config.run_id, attempt_num);
+    println!("run_id: {}", config.run_id);
     tracing::info!(config = ?config, "read config");
     trace::otel_trace::init_tracing_with_otel("convert_invert".to_string(), config.run_id)
         .context("Tracing")?;
@@ -29,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let download_path =
-        PathBuf::from_str("/home/gonik/Music/quinta_falopa").context("Acquiring download dir")?;
+        PathBuf::from_str("/home/gonik/Music/randomRepeated").context("Acquiring download dir")?;
 
     let (search_manager, mut download_manager, judge_manager, query_manager) = {
         let mut client = Client::with_settings(client_settings);

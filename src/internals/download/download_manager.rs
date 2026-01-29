@@ -109,7 +109,7 @@ async fn download_track(
     path: PathBuf,
     client: Arc<Client>,
 ) -> anyhow::Result<()> {
-    let sem = Arc::new(Semaphore::new(1));
+    let sem = Arc::new(Semaphore::new(5));
     let song_path = PathBuf::from_str(&song.filename).context("Can't parse filename")?;
     let path = path.join(song_path.file_name().context("Cannot create file")?);
     let path_str = path.as_path().to_str().context("Non valid path")?;

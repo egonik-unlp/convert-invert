@@ -1,9 +1,9 @@
 #![allow(unused, dead_code)]
 use crate::internals::{parsing::deserialize, search::search_manager::SearchItem};
 use anyhow::Context;
+use rand::Rng;
 use std::time::Duration;
 use tokio::{sync::mpsc::Sender, time::sleep};
-
 pub struct QueryManager {
     playlist_url: String,
     data_tx: Sender<SearchItem>,
@@ -25,7 +25,11 @@ impl QueryManager {
         let data: deserialize::Playlist = serde_json::from_str(data_string).unwrap();
         let queries: Vec<SearchItem> = data.into();
         let start_time = chrono::Local::now();
-        for (n, song) in queries.into_iter().skip(4).enumerate() {
+        let random_start = {
+            let mut rng = rand::rng();
+            rng.random_range(0..(queries.len() - 10))
+        };
+        for (n, song) in queries.into_iter().skip(random_start).enumerate() {
             self.data_tx
                 .send(song.clone())
                 .await
