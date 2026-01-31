@@ -116,10 +116,10 @@ impl SearchManager {
             })
             .collect()
     }
-    pub async fn run(&self, track: SearchItem) -> anyhow::Result<Vec<Track>> {
+    pub async fn run(&self, track: SearchItem, count_cutoff: usize) -> anyhow::Result<Vec<Track>> {
         let client = self.client.clone();
         let hand: JoinHandle<anyhow::Result<Vec<Track>>> = tokio::spawn(async move {
-            let res = track_search_task(client, track)
+            let res = track_search_task(client, track, count_cutoff)
                 .await
                 .context("Track search context")?;
             Ok(res)
@@ -156,6 +156,7 @@ pub struct DumpData {
 pub async fn track_search_task(
     client: Arc<soulseek_rs::Client>,
     data: SearchItem,
+    count_cutoff: usize,
 ) -> anyhow::Result<Vec<Track>> {
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
     let cancel = Arc::new(AtomicBool::new(false));
@@ -169,7 +170,7 @@ pub async fn track_search_task(
         tokio::task::spawn_blocking(move || {
             search_client.search_with_cancel(
                 query_string_search.as_str(),
-                Duration::from_secs(100), // Reduced duration for faster exit
+                Duration::from_secs(10), // Reduced duration for faster exit
                 Some(cancel_search),
             )
         })
@@ -221,7 +222,7 @@ pub async fn track_search_task(
         } else {
             count += 1;
         }
-        if count > TIMES_WITH_NO_NEW_FILES {
+        if count > count_cutoff {
             tracing::info!(
                 times = TIMES_WITH_NO_NEW_FILES,
                 query_string = query_string,

@@ -111,12 +111,20 @@ impl Managers {
                     let managers = Arc::clone(&managers);
                     let sender = Arc::clone(&sender);
                     tracing::info!(?search_item, "Enter search_item");
-                    let tracks = managers
-                        .search_manager
-                        .run(search_item)
+                    let tracks: JoinHandle<anyhow::Result<Vec<Track>>> = tokio::spawn(async move {
+                        let track_results = managers
+                            .search_manager
+                            .run(search_item, 0)
+                            .await
+                            .context("returning track")?;
+                        Ok(track_results)
+                    });
+
+                    for track in tracks
                         .await
-                        .context("returning track")?;
-                    for track in tracks {
+                        .context("Joining after search")?
+                        .context("inner")?
+                    {
                         send(track, &sender.clone()).await?;
                     }
                 }
@@ -161,6 +169,26 @@ impl Managers {
                     successful_downloads.push(downloaded_file);
                 }
                 Track::Retry(retry_request) => {
+                    let managers = Arc::clone(&managers);
+                    let sender = Arc::clone(&sender);
+                    tracing::info!(?retry_request.request, "Retry zone");
+                    let search_item = retry_request.request.clone();
+                    let tracks: JoinHandle<anyhow::Result<Vec<Track>>> = tokio::spawn(async move {
+                        let track_results = managers
+                            .search_manager
+                            .run(search_item.track, 5)
+                            .await
+                            .context("returning track")?;
+                        Ok(track_results)
+                    });
+
+                    for track in tracks
+                        .await
+                        .context("Joining after search")?
+                        .context("inner")?
+                    {
+                        send(track, &sender.clone()).await?;
+                    }
                     tracing::info!(?retry_request, "Retry requestedfile")
                 }
             };
