@@ -10,7 +10,7 @@ use tokio::{
 };
 use tracing::instrument;
 
-use crate::internals::search::search_manager::JudgeSubmission;
+use crate::internals::{context::context_manager::Track, search::search_manager::JudgeSubmission};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ResponseFormat {
@@ -82,7 +82,7 @@ impl JudgeManager {
         tracing::debug!("Judge Thread shutting down");
         Ok(())
     }
-    pub async fn run(self, track: JudgeSubmission) -> Result<Track> {
+    pub async fn run(self, track: JudgeSubmission) -> anyhow::Result<Track> {
         todo!()
     }
 }
