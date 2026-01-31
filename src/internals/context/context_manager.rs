@@ -1,9 +1,12 @@
 use std::{path::PathBuf, sync::Arc};
 
-use soulseek_rs::Client;
-use tokio::sync::{
-    RwLock,
-    mpsc::{Receiver, Sender},
+use soulseek_rs::{Client, ClientSettings};
+use tokio::{
+    sync::{
+        RwLock,
+        mpsc::{Receiver, Sender},
+    },
+    task::JoinHandle,
 };
 
 use anyhow::Context;
@@ -64,7 +67,13 @@ pub struct Managers {
 
 impl Managers {
     pub fn new(score: f32, path: PathBuf, config: Config) -> Self {
-        let mut client = Client::new(config.user_name, config.user_password);
+        let client_settings = ClientSettings {
+            username: config.user_name,
+            password: config.user_password,
+            listen_port: config.listen_port,
+            ..Default::default()
+        };
+        let mut client = Client::with_settings(client_settings);
         client.connect();
         let client = Arc::new(client);
         let download_manager = DownloadManager::new(client.clone(), path);
@@ -85,44 +94,56 @@ impl Managers {
         sender: Sender<Track>,
         mut receiver: Receiver<Track>,
     ) -> anyhow::Result<()> {
-        let Managers {
-            client,
-            download_manager,
-            search_manager,
-            query_manager,
-            judge_manager,
-        } = self;
-        client.login().context("Could not connect")?;
+        let managers = Arc::new(self);
+        managers.client.login().context("Could not connect")?;
+        let sender = Arc::new(sender);
         let storage = Vec::new();
         let state = Arc::new(RwLock::new(storage));
-        let tracks = query_manager.run().await.context("Query")?;
+        let tracks = managers.query_manager.run().await.context("Query")?;
         for track in tracks {
             send(track, &sender).await?;
         }
         let mut successful_downloads = vec![];
+        let mut handles = vec![];
         while let Some(track) = receiver.recv().await {
             match track {
                 Track::Query(search_item) => {
-                    let tracks = search_manager
+                    let managers = Arc::clone(&managers);
+                    let sender = Arc::clone(&sender);
+                    tracing::info!(?search_item, "Enter search_item");
+                    let tracks = managers
+                        .search_manager
                         .run(search_item)
                         .await
                         .context("returning track")?;
                     for track in tracks {
-                        send(track, &sender).await?;
+                        send(track, &sender.clone()).await?;
                     }
                 }
                 Track::Result(judge_submission) => {
-                    let track = judge_manager
-                        .run(judge_submission)
-                        .await
-                        .context("Returning judge_submission")?;
-                    if let Some(track) = track {
-                        send(track, &sender).await.context("returning to main")?
-                    }
+                    let managers = Arc::clone(&managers);
+                    let sender = Arc::clone(&sender);
+                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                        tracing::info!(?judge_submission, "Enter result");
+                        let track = managers
+                            .judge_manager
+                            .run(judge_submission)
+                            .await
+                            .context("Returning judge_submission")?;
+                        if let Some(track) = track {
+                            send(track, &sender).await.context("returning to main")?
+                        }
+                        Ok(())
+                    });
+                    handles.push(handle);
                 }
                 Track::Downloadable(judge_submission) => {
+                    let managers = Arc::clone(&managers);
+                    let sender = Arc::clone(&sender);
+                    tracing::info!(?judge_submission, "Enter downloadable");
                     if state.read().await.contains(&judge_submission) {
-                        let track = download_manager
+                        let track = managers
+                            .download_manager
                             .run(judge_submission.clone())
                             .await
                             .context("Downloading")?;
@@ -145,6 +166,9 @@ impl Managers {
             };
         }
         tracing::info!(?successful_downloads, "Finished all");
+        for handle in handles {
+            handle.await.context("Threads joining")?.context("inner")?;
+        }
         Ok(())
     }
 }
