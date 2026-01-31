@@ -1,16 +1,10 @@
-use std::sync::Arc;
-
-use anyhow::Context;
+use anyhow::{Context, Ok};
 use async_trait::async_trait;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use tokio::{
-    sync::mpsc::{Receiver, Sender},
-    task::JoinHandle,
-};
 use tracing::instrument;
 
-use crate::internals::search::search_manager::JudgeSubmission;
+use crate::internals::{context::context_manager::Track, search::search_manager::JudgeSubmission};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ResponseFormat {
@@ -26,64 +20,24 @@ pub trait Judge: Send + Sync {
 }
 
 pub struct JudgeManager {
-    pub judge_queue: Receiver<JudgeSubmission>,
-    pub download_queue: Sender<JudgeSubmission>,
     pub method: Box<dyn Judge>,
 }
 impl JudgeManager {
-    pub fn new(
-        judge_queue: Receiver<JudgeSubmission>,
-        download_queue: Sender<JudgeSubmission>,
-        method: Box<dyn Judge>,
-    ) -> JudgeManager {
-        JudgeManager {
-            judge_queue,
-            download_queue,
-            method,
-        }
+    pub fn new(method: Box<dyn Judge>) -> JudgeManager {
+        JudgeManager { method }
     }
-    #[instrument(name = "JudgeManager::run", skip(self))]
-    pub async fn run_channel(self) -> anyhow::Result<()> {
-        let mut threads = vec![];
-        let JudgeManager {
-            mut judge_queue,
-            download_queue,
-            method,
-        } = self;
-        let method = Arc::new(method);
-        while let Some(msg) = judge_queue.recv().await {
-            let method = Arc::clone(&method);
-            let download_queue = download_queue.clone();
-            let judge_thread: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                tracing::info!("received in judge manager = {:?}", msg);
-                let response = method
-                    .judge(msg.clone())
-                    .await
-                    .context("awaiting judge response")?;
-                if response {
-                    download_queue
-                        .clone()
-                        .send(msg.clone())
-                        .await
-                        .context("Sending passed file")?;
-                    tracing::debug!("Sent to download_queue: {:?}", msg);
-                }
-                Ok(())
-            });
-            threads.push(judge_thread);
+    pub async fn run(&self, track: JudgeSubmission) -> anyhow::Result<Option<Track>> {
+        tracing::info!("received in judge manager = {:?}", track);
+        let response = self
+            .method
+            .judge(track.clone())
+            .await
+            .context("awaiting judge response")?;
+        if response {
+            Ok(Some(Track::Downloadable(track)))
+        } else {
+            Ok(None)
         }
-        // .instrument(span),
-        for thread in threads {
-            thread
-                .await
-                .context("joining judgre thread")?
-                .context("inner judge")?;
-        }
-        tracing::debug!("Judge Thread shutting down");
-        Ok(())
-    }
-    pub async fn run(self, track: JudgeSubmission) -> Result<Track> {
-        todo!()
     }
 }
 
