@@ -7,6 +7,7 @@ use tokio::{
         mpsc::{Receiver, Sender},
     },
     task::JoinHandle,
+    time,
 };
 
 use anyhow::Context;
@@ -108,9 +109,11 @@ impl Managers {
         while let Some(track) = receiver.recv().await {
             match track {
                 Track::Query(search_item) => {
+                    let loggable = search_item.clone();
                     let managers = Arc::clone(&managers);
                     let sender = Arc::clone(&sender);
                     tracing::info!(?search_item, "Enter search_item");
+                    let start_of = time::Instant::now();
                     let tracks: JoinHandle<anyhow::Result<Vec<Track>>> = tokio::spawn(async move {
                         let track_results = managers
                             .search_manager
@@ -125,6 +128,13 @@ impl Managers {
                         .context("Joining after search")?
                         .context("inner")?
                     {
+                        let endtime = (time::Instant::now() - start_of).as_secs_f64();
+                        tracing::info!(
+                            track = ?&track,
+                            endtime = endtime,
+                            item = ?loggable,
+                            "Lapse of time"
+                        );
                         send(track, &sender.clone()).await?;
                     }
                 }

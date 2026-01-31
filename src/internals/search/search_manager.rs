@@ -170,7 +170,7 @@ pub async fn track_search_task(
         tokio::task::spawn_blocking(move || {
             search_client.search_with_cancel(
                 query_string_search.as_str(),
-                Duration::from_secs(10), // Reduced duration for faster exit
+                Duration::from_secs(30), // Reduced duration for faster exit
                 Some(cancel_search),
             )
         })
