@@ -44,9 +44,9 @@ async fn main() -> anyhow::Result<()> {
 
         tracing::info!(user_name = config.user_name, "Logged in");
 
-        let (data_tx, data_rx) = tokio::sync::mpsc::channel(2000);
-        let (results_tx, results_rx) = tokio::sync::mpsc::channel(2000);
-        let (download_tx, download_rx) = tokio::sync::mpsc::channel(2000);
+        let (data_tx, data_rx) = tokio::sync::mpsc::channel(10000);
+        let (results_tx, results_rx) = tokio::sync::mpsc::channel(10000);
+        let (download_tx, download_rx) = tokio::sync::mpsc::channel(10000);
 
         let search_manager = SearchManager::new(client.clone(), data_rx, results_tx);
 

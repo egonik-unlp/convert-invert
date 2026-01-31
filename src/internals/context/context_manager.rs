@@ -1,7 +1,4 @@
-use tokio::sync::mpsc::{Receiver, Sender};
-
 use anyhow::Context;
-use soulseek_rs::Client;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::internals::{
@@ -11,7 +8,6 @@ use crate::internals::{
     search::search_manager::{
         DownloadableFile, JudgeSubmission, SearchItem, SearchManager, Status,
     },
-    utils::config,
 };
 
 #[allow(dead_code)]
