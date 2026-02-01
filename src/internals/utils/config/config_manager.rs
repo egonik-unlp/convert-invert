@@ -3,7 +3,6 @@ use std::env;
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
 
-#[allow(dead_code)]
 #[derive(Debug, Default, Clone)]
 pub struct Config {
     pub run_id: String,
@@ -52,6 +51,7 @@ impl Config {
         })
     }
 
+    //TODO: Find a way
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         log_level: EnvFilter,

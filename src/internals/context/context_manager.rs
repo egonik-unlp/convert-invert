@@ -1,93 +1,285 @@
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use serde::{Deserialize, Serialize};
+use soulseek_rs::{Client, ClientSettings};
+use tokio::{
+    fs::OpenOptions,
+    io::AsyncWriteExt,
+    sync::{
+        RwLock, Semaphore,
+        mpsc::{Receiver, Sender},
+    },
+    task::JoinHandle,
+};
+
 use anyhow::Context;
-use tokio::sync::mpsc::{self, Receiver, Sender};
 
 use crate::internals::{
     download::download_manager::DownloadManager,
-    judge::judge_manager::JudgeManager,
+    judge::judge_manager::{JudgeManager, Levenshtein},
     query::query_manager::QueryManager,
-    search::search_manager::{
-        DownloadableFile, JudgeSubmission, SearchItem, SearchManager, Status,
-    },
+    search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem, SearchManager},
+    utils::config::config_manager::Config,
 };
 
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct ContextManager {
-    status: Receiver<Status>,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DownloadedFile {
+    pub filename: String,
 }
 
 #[derive(Debug)]
-pub struct DownloadedFile;
-
-#[allow(dead_code)]
-#[derive(Debug)]
 pub struct RetryRequest {
-    request: JudgeSubmission,
-    retry_attempts: u8,
-    failed_download_result: DownloadableFile,
+    pub request: JudgeSubmission,
+    pub retry_attempts: u8,
+    pub failed_download_result: DownloadableFile,
 }
 
 #[derive(Debug)]
 pub enum Track {
-    Query(Vec<SearchItem>),
+    Query(SearchItem),
     Result(JudgeSubmission),
     Downloadable(JudgeSubmission),
     File(DownloadedFile),
     Retry(RetryRequest),
+    Reject(RejectedTrack),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RejectedTrack {
+    track: JudgeSubmission,
+    reason: RejectReason,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RejectReason {
+    AlreadyDownloaded,
+    LowScore(f32),
+    NotMusic(String),
+    AbandonedAttemptingSearch,
+}
+
+impl RejectedTrack {
+    pub fn new(track: JudgeSubmission, reason: RejectReason) -> Self {
+        Self { track, reason }
+    }
 }
 
 pub trait Manager {
     fn run(self) -> anyhow::Result<()>;
 }
+pub async fn send(message: Track, chan: &Sender<Track>) -> anyhow::Result<()> {
+    chan.send(message).await.context("Send to channel")?;
+    Ok(())
+}
 
-#[allow(dead_code)]
 pub struct Managers {
+    pub client: Arc<Client>,
     pub download_manager: DownloadManager,
     pub search_manager: SearchManager,
     pub query_manager: QueryManager,
     pub judge_manager: JudgeManager,
-    pub sender: Sender<Track>,
+}
+
+#[derive(Debug)]
+pub struct RunTools {
+    pub download_semaphore: Semaphore,
+    pub search_semaphore: Semaphore,
+    pub successful_downloads: Vec<Track>,
+    pub rejected_tracks: Vec<Track>,
+    pub handles: Vec<JoinHandle<anyhow::Result<()>>>,
+}
+
+impl RunTools {
+    pub fn new(search_limit: usize, download_limit: usize) -> Self {
+        let search_semaphore = Semaphore::new(search_limit);
+        let download_semaphore = Semaphore::new(download_limit);
+        let successful_downloads = vec![];
+        let rejected_tracks = vec![];
+        let handles = vec![];
+        Self {
+            search_semaphore,
+            download_semaphore,
+            successful_downloads,
+            rejected_tracks,
+            handles,
+        }
+    }
 }
 
 impl Managers {
-    pub fn new(_score: i32) -> Self {
-        // let config = config::config_manager::Config::try_from_env().unwrap();
-        // let client = Arc::new(Client::new(config.user_name, config.user_password));
-        // let download_manager = DownloadManager::new(client.clone(), "~/Music/falopa", download_queue);
-        // let search_manager = SearchManager::new(client.clone(), );
-        // let judge_manager = JudgeManager::new(judge_queue, download_queue, method):
-        // let query_manager = QueryManager::new(, data_tx);
-        // Managers {
-        //     download_manager,
-        //     search_manager,
-        //     judge_manager,
-        //     query_manager
-        // }
-        todo!();
+    pub fn new(score: f32, path: PathBuf, config: Config) -> Self {
+        let client_settings = ClientSettings {
+            username: config.user_name,
+            password: config.user_password,
+            listen_port: config.listen_port,
+            ..Default::default()
+        };
+        let mut client = Client::with_settings(client_settings);
+        client.connect();
+        let client = Arc::new(client);
+        let download_manager = DownloadManager::new(client.clone(), path);
+        let search_manager = SearchManager::new(client.clone());
+        let lev_judge = Levenshtein::new(score);
+        let judge_manager = JudgeManager::new(Box::new(lev_judge));
+        let query_manager = QueryManager::new("ff");
+        Managers {
+            client,
+            download_manager,
+            search_manager,
+            judge_manager,
+            query_manager,
+        }
+    }
+
+    pub async fn run_cycle(
+        self,
+        sender: Sender<Track>,
+        mut receiver: Receiver<Track>,
+    ) -> anyhow::Result<()> {
+        let managers = Arc::new(self);
+        managers.client.login().context("Could not connect")?;
+        let sender = Arc::new(sender);
+        let storage = Vec::new();
+        let state = Arc::new(RwLock::new(storage));
+        let tracks = managers.query_manager.run().await.context("Query")?;
+        for track in tracks {
+            send(track, &sender).await?;
+        }
+
+        let search_semaphore = Arc::new(Semaphore::new(5));
+        let download_semaphore = Arc::new(Semaphore::new(5));
+        let mut successful_downloads = vec![];
+        let mut rejected_tracks = vec![];
+        let mut handles = vec![];
+
+        while let Some(track) = receiver.recv().await {
+            match track {
+                Track::Query(search_item) => {
+                    let managers = Arc::clone(&managers);
+                    let sender = Arc::clone(&sender);
+                    let semaphore = download_semaphore.clone();
+                    tracing::info!(?search_item, "Enter search_item");
+                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                        managers
+                            .search_manager
+                            .run(search_item, 0, semaphore, sender)
+                            .await
+                            .context("returning track")?
+                            .await
+                            .context("inner")?
+                            .context("one more")?;
+                        Ok(())
+                    });
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    handles.push(handle);
+                }
+                Track::Result(judge_submission) => {
+                    let managers = Arc::clone(&managers);
+                    let sender = Arc::clone(&sender);
+                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                        tracing::info!(?judge_submission, "Enter result");
+                        managers
+                            .judge_manager
+                            .run(judge_submission, sender)
+                            .await
+                            .context("Returning judge_submission")?;
+                        Ok(())
+                    });
+                    handle.await.context("handle-revisar")?.context("inner")?;
+                }
+                Track::Downloadable(judge_submission) => {
+                    let semaphore = download_semaphore.clone();
+                    let managers = Arc::clone(&managers);
+                    let sender = Arc::clone(&sender);
+                    tracing::info!(?judge_submission, "Enter downloadable");
+                    let judge_sub = judge_submission.clone();
+                    if !state.read().await.contains(&judge_submission) {
+                        let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                            managers
+                                .download_manager
+                                .run(judge_sub, semaphore, sender)
+                                .await
+                                .context("Downloading")?;
+                            Ok(())
+                        });
+                        handles.push(handle);
+                    } else {
+                        let reject = RejectedTrack::new(
+                            judge_submission.clone(),
+                            RejectReason::AlreadyDownloaded,
+                        );
+                        send(Track::Reject(reject), &sender)
+                            .await
+                            .context("sending rejected_tracks")?;
+                    }
+                    let mut write = state.write().await;
+                    write.push(judge_submission);
+                }
+                Track::File(downloaded_file) => {
+                    tracing::info!(?downloaded_file, "Downloaded file");
+                    successful_downloads.push(downloaded_file);
+                    dump_a_vec(&successful_downloads, "successes.json".into())
+                        .await
+                        .context("dumping succ")?;
+                }
+                Track::Retry(mut retry_request) => {
+                    if retry_request.retry_attempts >= 3 {
+                        let reject = RejectedTrack::new(
+                            retry_request.request,
+                            RejectReason::AbandonedAttemptingSearch,
+                        );
+                        send(Track::Reject(reject), &sender)
+                            .await
+                            .context("rejecting")?;
+                        break;
+                    }
+                    retry_request.retry_attempts += 1;
+                    let managers = Arc::clone(&managers);
+                    let semaphore = search_semaphore.clone();
+                    let sender = Arc::clone(&sender);
+                    tracing::info!(?retry_request.request, "Retry zone");
+                    let search_item = retry_request.request.clone();
+                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                        managers
+                            .search_manager
+                            .run(search_item.track, 5, semaphore, sender)
+                            .await
+                            .context("returning track")?;
+                        Ok(())
+                    });
+                    handles.push(handle);
+                    tracing::info!(?retry_request, "Retry requestedfile")
+                }
+                Track::Reject(rejected_track) => {
+                    rejected_tracks.push(rejected_track);
+                    dump_a_vec(&rejected_tracks, "rejects_dump.json".into())
+                        .await
+                        .context("dumping")?
+                }
+            };
+        }
+        tracing::info!(?successful_downloads, "Finished all");
+        for handle in handles {
+            handle.await.context("Threads joining")?.context("inner")?;
+        }
+        Ok(())
     }
 }
 
-#[allow(unused_variables)]
-pub async fn manager(
-    mut receiver: Receiver<Track>,
-    sender: Sender<Track>,
-    managers: Managers,
-) -> anyhow::Result<()> {
-    while let Some(track) = receiver.recv().await {
-        match track {
-            Track::Query(search_item) => {
-                let x = Managers::new(75)
-                    .query_manager
-                    .run()
-                    .await
-                    .context("Query")?;
-                sender.clone().send(x).await.unwrap();
-            }
-            Track::Result(judge_submission) => todo!(),
-            Track::Downloadable(judge_submission) => todo!(),
-            Track::File(downloaded_file) => todo!(),
-            Track::Retry(retry_request) => todo!(),
-        };
-    }
+async fn dump_a_vec<T>(data: &T, filename: String) -> anyhow::Result<()>
+where
+    T: Serialize,
+{
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(filename)
+        .await
+        .context("Creating rejects file")?;
+    let string = serde_json::to_string(data).context("Deserializing rejected track")?;
+    file.write_all(string.as_bytes())
+        .await
+        .context("writing rejects")?;
     Ok(())
 }
