@@ -1,10 +1,16 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Ok};
 use async_trait::async_trait;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::Sender;
 use tracing::instrument;
 
-use crate::internals::{context::context_manager::Track, search::search_manager::JudgeSubmission};
+use crate::internals::{
+    context::context_manager::{RejectReason, RejectedTrack, Track, send},
+    search::search_manager::JudgeSubmission,
+};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ResponseFormat {
@@ -26,18 +32,28 @@ impl JudgeManager {
     pub fn new(method: Box<dyn Judge>) -> JudgeManager {
         JudgeManager { method }
     }
-    pub async fn run(&self, track: JudgeSubmission) -> anyhow::Result<Option<Track>> {
+    pub async fn run(
+        &self,
+        track: JudgeSubmission,
+        sender: Arc<Sender<Track>>,
+    ) -> anyhow::Result<()> {
         tracing::info!("received in judge manager = {:?}", track);
         let response = self
             .method
-            .judge(track.clone())
+            .judge_score(track.clone())
             .await
             .context("awaiting judge response")?;
-        if response {
-            Ok(Some(Track::Downloadable(track)))
+        if response > 0.80 {
+            send(Track::Downloadable(track), &sender)
+                .await
+                .context("sending judgement")?;
         } else {
-            Ok(None)
+            let reject = RejectedTrack::new(track, RejectReason::LowScore(response));
+            send(Track::Reject(reject), &sender)
+                .await
+                .context("sending reject")?;
         }
+        Ok(())
     }
 }
 

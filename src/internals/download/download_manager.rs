@@ -1,11 +1,16 @@
 use crate::internals::{
-    context::context_manager::{DownloadedFile, RetryRequest, Track},
+    context::context_manager::{
+        DownloadedFile, RejectReason, RejectedTrack, RetryRequest, Track, send,
+    },
     search::search_manager::{DownloadableFile, JudgeSubmission},
 };
 use anyhow::Context;
 use soulseek_rs::{Client, DownloadStatus, SearchResult};
 use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{Semaphore, mpsc::Sender},
+    task::JoinHandle,
+};
 
 fn is_audio_file(filename: String) -> bool {
     let lc = filename.to_lowercase();
@@ -49,22 +54,35 @@ impl DownloadManager {
             root_location,
         }
     }
-    pub async fn run(&self, track: JudgeSubmission) -> anyhow::Result<Option<Track>> {
+    pub async fn run(
+        &self,
+        track: JudgeSubmission,
+        semaphore: Arc<Semaphore>,
+        sender: Arc<Sender<Track>>,
+    ) -> anyhow::Result<()> {
         let client = Arc::clone(&self.client);
         let download_location = self.root_location.clone();
         if is_audio_file(track.query.filename.clone()) {
+            let _permit = semaphore.acquire().await.context("acquiring semaphore")?;
             tracing::info!(track.query.filename, "send to download");
             let track = download_track(track, download_location.clone(), client)
                 .await
                 .context("Downloading track")?;
-            Ok(Some(track))
+            send(track, &sender).await.context("Sending to finish")?;
         } else {
+            let reject = RejectedTrack::new(
+                track.clone(),
+                RejectReason::NotMusic(track.query.filename.clone()),
+            );
+            send(Track::Reject(reject), &sender)
+                .await
+                .context("Rejection sending to chan")?;
             tracing::info!(
                 track.query.filename,
                 "Rejected non song & already downloaded file",
             );
-            Ok(None)
         }
+        Ok(())
     }
 }
 

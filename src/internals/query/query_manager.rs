@@ -1,3 +1,4 @@
+//TODO: Remove lint allows
 #![allow(unused, dead_code)]
 use crate::internals::{
     context::context_manager::Track, parsing::deserialize, search::search_manager::SearchItem,

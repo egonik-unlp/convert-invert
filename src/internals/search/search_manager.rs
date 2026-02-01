@@ -1,6 +1,7 @@
-#![allow(unused_labels)]
-
-use crate::internals::{context::context_manager::Track, parsing::deserialize::Playlist};
+use crate::internals::{
+    context::context_manager::{Track, send},
+    parsing::deserialize::Playlist,
+};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::SearchResult;
@@ -13,7 +14,11 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
     time::{self, Duration},
 };
-use tokio::{task::JoinHandle, time::sleep};
+use tokio::{
+    sync::{Semaphore, mpsc::Sender},
+    task::JoinHandle,
+    time::sleep,
+};
 use tracing::{Instrument, info_span, instrument};
 
 const TIMES_WITH_NO_NEW_FILES: usize = 3;
@@ -116,16 +121,22 @@ impl SearchManager {
             })
             .collect()
     }
-    pub async fn run(&self, track: SearchItem, count_cutoff: usize) -> anyhow::Result<Vec<Track>> {
+    pub async fn run(
+        &self,
+        track: SearchItem,
+        count_cutoff: usize,
+        semaphore: Arc<Semaphore>,
+        sender: Arc<Sender<Track>>,
+    ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
         let client = self.client.clone();
-        let hand: JoinHandle<anyhow::Result<Vec<Track>>> = tokio::spawn(async move {
-            let res = track_search_task(client, track, count_cutoff)
+        let hand: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            let _permit = semaphore.acquire().await.context("Getting permit")?;
+            track_search_task(client, track, count_cutoff, sender)
                 .await
                 .context("Track search context")?;
-            Ok(res)
+            Ok(())
         });
-        let track = hand.await.context("Search thread")?.context("inner")?;
-        Ok(track)
+        Ok(hand)
     }
 }
 
@@ -157,7 +168,8 @@ pub async fn track_search_task(
     client: Arc<soulseek_rs::Client>,
     data: SearchItem,
     count_cutoff: usize,
-) -> anyhow::Result<Vec<Track>> {
+    sender: Arc<Sender<Track>>,
+) -> anyhow::Result<()> {
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
     let cancel = Arc::new(AtomicBool::new(false));
     let mut find_history: Vec<soulseek_rs::SearchResult> = Vec::new();
@@ -184,8 +196,7 @@ pub async fn track_search_task(
         cancel = ?cancel,
         "About to enter search loop",
     );
-    #[allow(unused_parens)]
-    let results = 'main: loop {
+    'main: loop {
         tracing::info!("First line in result processing loop");
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
@@ -193,7 +204,7 @@ pub async fn track_search_task(
         tracing::info!("In infinite loop for {}", &query_string);
         if !results.is_empty() && !total_files_found.eq(&results_count) {
             find_history.extend(results.clone());
-            total_files_found += (results_count - total_files_found);
+            total_files_found += results_count - total_files_found;
             for result in results {
                 let submisssions = SearchManager::build_submissions(data.clone(), result);
                 for submission in submisssions {
@@ -207,6 +218,9 @@ pub async fn track_search_task(
                             "Submission received with cancel being:"
                         );
                         result_accum.push(Track::Result(submission.clone()));
+                        send(Track::Result(submission.clone()), &sender)
+                            .await
+                            .context("Sending result")?;
                         previous_submissions
                             .insert((submission.query.filename, submission.query.username));
                     } else {
@@ -229,15 +243,15 @@ pub async fn track_search_task(
                 "Exited because consecutive empty results",
             );
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            break 'main result_accum;
+            break 'main;
         }
-    };
+    }
     search_thread
         .await
         .unwrap()
         .context("Inner search thread issue")?;
     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    Ok(results)
+    Ok(())
 }
 
 fn dump_data_logging(

@@ -22,9 +22,10 @@ async fn main() -> anyhow::Result<()> {
     trace::otel_trace::init_tracing_with_otel("convert_invert".to_string(), config.run_id.clone())
         .context("Tracing")?;
     let download_path =
-        PathBuf::from_str("/home/gonik/Music/lessAsync").context("Acquiring download dir")?;
+        PathBuf::from_str("/home/gonik/Music/widerisimoBigChannelWithAsyncDownloadMasRaro")
+            .context("Acquiring download dir")?;
 
-    let (sender, receiver) = tokio::sync::mpsc::channel(6000);
+    let (sender, receiver) = tokio::sync::mpsc::channel(20000);
     let managers = Managers::new(0.75, download_path, config);
     managers
         .run_cycle(sender, receiver)
