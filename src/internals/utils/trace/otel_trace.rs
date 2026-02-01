@@ -1,17 +1,16 @@
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
-    runtime,
+    Resource, runtime,
     trace::{BatchConfig, RandomIdGenerator, Sampler},
-    Resource,
 };
 use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
 use std::time::Duration;
 use tracing_subscriber::{
+    EnvFilter,
     fmt::{self, format::FmtSpan},
     layer::SubscriberExt,
     util::SubscriberInitExt,
-    EnvFilter,
 };
 
 /// Initialize tracing with OpenTelemetry integration
