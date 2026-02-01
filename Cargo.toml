@@ -35,3 +35,4 @@ opentelemetry = "0.24"
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.17"
 opentelemetry-semantic-conventions = "0.31.0"
+rspotify = { version = "0.15.3", features = ["dotenvy"] }

@@ -16,7 +16,7 @@ use anyhow::Context;
 
 use crate::internals::{
     download::download_manager::DownloadManager,
-    judge::judge_manager::{JudgeManager, Levenshtein},
+    judge::{judge_manager::JudgeManager, judges::levenshtein::Levenshtein},
     query::query_manager::QueryManager,
     search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem, SearchManager},
     utils::config::config_manager::Config,
@@ -151,7 +151,6 @@ impl Managers {
         let mut successful_downloads = vec![];
         let mut rejected_tracks = vec![];
         let mut handles = vec![];
-
         while let Some(track) = receiver.recv().await {
             match track {
                 Track::Query(search_item) => {
@@ -223,10 +222,6 @@ impl Managers {
                         .context("dumping succ")?;
                 }
                 Track::Retry(mut retry_request) => {
-                    tokio::time::sleep(Duration::from_secs(
-                        10 * retry_request.retry_attempts as u64,
-                    ))
-                    .await;
                     if retry_request.retry_attempts >= 3 {
                         let reject = RejectedTrack::new(
                             retry_request.request,

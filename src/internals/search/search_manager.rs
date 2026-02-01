@@ -8,11 +8,9 @@ use soulseek_rs::SearchResult;
 use std::{
     collections::HashSet,
     fmt::Display,
-    fs::OpenOptions,
     hash::{DefaultHasher, Hash, Hasher},
-    io::Write,
     sync::{Arc, atomic::AtomicBool},
-    time::{self, Duration},
+    time::Duration,
 };
 use tokio::{
     sync::{Semaphore, mpsc::Sender},
@@ -72,12 +70,7 @@ impl From<Playlist> for Vec<SearchItem> {
             .collect()
     }
 }
-#[derive(Debug, Clone)]
-pub enum Status {
-    Done(String),
-    InSearch,
-    Downloading(String),
-}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DownloadableFile {
     pub filename: String,
@@ -140,22 +133,6 @@ impl SearchManager {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct OwnSearchResult {
-    filenames: Vec<String>,
-}
-impl From<SearchResult> for OwnSearchResult {
-    fn from(value: SearchResult) -> Self {
-        let filenames = value.files.into_iter().map(|f| f.name).collect();
-        OwnSearchResult { filenames }
-    }
-}
-#[derive(Debug, Deserialize, Serialize)]
-pub struct DumpData {
-    results: Vec<OwnSearchResult>,
-    query: SearchItem,
-}
-
 #[instrument(
     name = "track_search_task",
     skip(client ),
@@ -172,8 +149,6 @@ pub async fn track_search_task(
 ) -> anyhow::Result<()> {
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut find_history: Vec<soulseek_rs::SearchResult> = Vec::new();
-    let mut result_accum = vec![];
     let span = info_span!("track_blocking");
     let search_thread = {
         let search_client = client.clone();
@@ -191,19 +166,11 @@ pub async fn track_search_task(
     let mut previous_submissions = HashSet::new();
     let mut count = 0;
     let mut total_files_found = 0;
-    tracing::info!(
-        string_query = &query_string,
-        cancel = ?cancel,
-        "About to enter search loop",
-    );
     'main: loop {
-        tracing::info!("First line in result processing loop");
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
         let results_count: usize = results.iter().map(|res| res.files.len()).sum();
-        tracing::info!("In infinite loop for {}", &query_string);
         if !results.is_empty() && !total_files_found.eq(&results_count) {
-            find_history.extend(results.clone());
             total_files_found += results_count - total_files_found;
             for result in results {
                 let submisssions = SearchManager::build_submissions(data.clone(), result);
@@ -212,27 +179,15 @@ pub async fn track_search_task(
                         submission.query.filename.clone(),
                         submission.query.username.clone(),
                     )) {
-                        tracing::debug!(submission = ?submission.clone(), "Sent submission");
-                        tracing::debug!(
-                            cancel =?cancel,
-                            "Submission received with cancel being:"
-                        );
-                        result_accum.push(Track::Result(submission.clone()));
                         send(Track::Result(submission.clone()), &sender)
                             .await
                             .context("Sending result")?;
                         previous_submissions
                             .insert((submission.query.filename, submission.query.username));
-                    } else {
-                        tracing::debug!(
-                            submission = ?submission,
-                            "Rejected entry because it already was submitted",
-                        );
                     }
                 }
             }
             count = 0;
-            dump_data_logging(data.clone(), find_history.clone()).context("dumping")?;
         } else {
             count += 1;
         }
@@ -246,46 +201,10 @@ pub async fn track_search_task(
             break 'main;
         }
     }
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     search_thread
         .await
         .unwrap()
         .context("Inner search thread issue")?;
-    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    Ok(())
-}
-
-fn dump_data_logging(
-    data: SearchItem,
-    find_history: Vec<soulseek_rs::SearchResult>,
-) -> anyhow::Result<()> {
-    let query = data.clone();
-    let filename_dump = format!("dumps/dump_{}_{}.json", data.track.as_str(), data.artist);
-    let mut file_dump = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(filename_dump.clone())
-        .context("creating filedump")?;
-    let mut filenames_dump = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("dump_writelens.txt")
-        .context("creating writelens")?;
-    let results: Vec<OwnSearchResult> =
-        find_history.clone().into_iter().map(|f| f.into()).collect();
-    let writefiles_string = format!(
-        "writelen = {}, stamp = {:?}, file = {}\n",
-        results.len(),
-        time::Instant::now(),
-        filename_dump
-    );
-    filenames_dump
-        .write_all(writefiles_string.as_bytes())
-        .unwrap();
-    let data_dump = DumpData { results, query };
-    let dump_string = serde_json::to_string(&data_dump).context("Deserialization issue")?;
-    file_dump
-        .write_all(dump_string.as_bytes())
-        .context("writing in dump")?;
     Ok(())
 }

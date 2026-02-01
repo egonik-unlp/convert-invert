@@ -2,10 +2,10 @@ use crate::internals::{
     context::context_manager::{
         DownloadedFile, RejectReason, RejectedTrack, RetryRequest, Track, send,
     },
-    search::search_manager::{DownloadableFile, JudgeSubmission},
+    search::search_manager::JudgeSubmission,
 };
 use anyhow::Context;
-use soulseek_rs::{Client, DownloadStatus, SearchResult};
+use soulseek_rs::{Client, DownloadStatus};
 use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 use tokio::{
     sync::{Semaphore, mpsc::Sender},
@@ -17,31 +17,6 @@ fn is_audio_file(filename: String) -> bool {
     lc.ends_with(".mp3") || lc.ends_with(".flac") || lc.ends_with(".aiff")
 }
 
-pub struct DownloadableFiles(pub Vec<DownloadableFile>);
-impl From<SearchResult> for DownloadableFiles {
-    fn from(value: SearchResult) -> Self {
-        let values = value
-            .files
-            .into_iter()
-            .map(|file| {
-                let filename = file.name;
-                let username = file.username;
-                let size = file.size;
-                DownloadableFile {
-                    filename,
-                    username,
-                    size,
-                }
-            })
-            .collect();
-        DownloadableFiles(values)
-    }
-}
-impl From<DownloadableFiles> for Vec<DownloadableFile> {
-    fn from(value: DownloadableFiles) -> Self {
-        value.0
-    }
-}
 pub struct DownloadManager {
     client: Arc<Client>,
     root_location: PathBuf,
