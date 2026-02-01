@@ -132,21 +132,17 @@ async fn download_track(
                                 filename: song.query.filename,
                             });
                         }
-                        Ok(
-                            DownloadStatus::Failed
-                            | DownloadStatus::TimedOut
-                            | DownloadStatus::InProgress { .. },
-                        )
-                        | Err(_) => {
+                        Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) | Err(_) => {
+                            tracing::error!(?song, "Error descargando, se salio del loop");
                             return Track::Retry(RetryRequest {
                                 request: song.clone(),
                                 retry_attempts: 0,
                                 failed_download_result: song.query,
                             });
                         }
+                        _ => continue,
                     }
                 }
-                // tracing::info!("Reached ending of blocking thread")
             });
             Ok(track)
         });

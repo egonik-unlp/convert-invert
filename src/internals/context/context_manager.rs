@@ -223,6 +223,10 @@ impl Managers {
                         .context("dumping succ")?;
                 }
                 Track::Retry(mut retry_request) => {
+                    tokio::time::sleep(Duration::from_secs(
+                        10 * retry_request.retry_attempts as u64,
+                    ))
+                    .await;
                     if retry_request.retry_attempts >= 3 {
                         let reject = RejectedTrack::new(
                             retry_request.request,

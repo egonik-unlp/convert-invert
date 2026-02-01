@@ -43,7 +43,7 @@ impl JudgeManager {
             .judge_score(track.clone())
             .await
             .context("awaiting judge response")?;
-        if response > 0.80 {
+        if response > 0.75 {
             send(Track::Downloadable(track), &sender)
                 .await
                 .context("sending judgement")?;
