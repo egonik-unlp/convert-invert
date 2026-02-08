@@ -1,7 +1,8 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
-
+use crate::internals::database::{manager::DatabaseManager, schema};
+use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     fs::OpenOptions,
     io::AsyncWriteExt,
@@ -62,6 +63,10 @@ impl RejectedTrack {
     pub fn new(track: JudgeSubmission, reason: RejectReason) -> Self {
         Self { track, reason }
     }
+
+    pub fn parts(&self) -> (&JudgeSubmission, &RejectReason) {
+        (&self.track, &self.reason)
+    }
 }
 
 pub trait Manager {
@@ -107,7 +112,7 @@ impl RunTools {
 }
 
 impl Managers {
-    pub fn new(score: f32, path: PathBuf, config: Config) -> Self {
+    pub fn new(score: Option<f32>, path: PathBuf, config: Config) -> Self {
         let client_settings = ClientSettings {
             username: config.user_name,
             password: config.user_password,
@@ -119,9 +124,13 @@ impl Managers {
         let client = Arc::new(client);
         let download_manager = DownloadManager::new(client.clone(), path);
         let search_manager = SearchManager::new(client.clone());
-        let lev_judge = Levenshtein::new(score);
+        let lev_judge = Levenshtein::new(score.unwrap_or(0.75));
         let judge_manager = JudgeManager::new(Box::new(lev_judge));
-        let query_manager = QueryManager::new("ff");
+        let query_manager = QueryManager::new(
+            "1B3Q6EB9Pjb57jKywHJPfq?si=2f36139519544813",
+            config.client_id,
+            config.client_secret,
+        );
         Managers {
             client,
             download_manager,
@@ -130,13 +139,27 @@ impl Managers {
             query_manager,
         }
     }
-
+    pub async fn get_playlist(&self) -> Vec<Track> {
+        self.query_manager.clone().fetch_playlist().await.unwrap()
+    }
+    pub async fn inject_tracks(
+        track_chunk: impl IntoIterator<Item = Track>,
+        sender: Sender<Track>,
+    ) -> anyhow::Result<Sender<Track>> {
+        for track in track_chunk {
+            send(track, &sender).await.unwrap();
+        }
+        Ok(sender)
+    }
     pub async fn run_cycle(
         self,
         sender: Sender<Track>,
         mut receiver: Receiver<Track>,
+        connection: &mut PgConnection,
     ) -> anyhow::Result<()> {
         let managers = Arc::new(self);
+        let mut database_manager = DatabaseManager::new(connection);
+
         managers.client.login().context("Could not connect")?;
         let sender = Arc::new(sender);
         let storage = Vec::new();
@@ -146,17 +169,20 @@ impl Managers {
             send(track, &sender).await?;
         }
 
-        let search_semaphore = Arc::new(Semaphore::new(5));
+        let search_semaphore = Arc::new(Semaphore::new(3));
         let download_semaphore = Arc::new(Semaphore::new(5));
         let mut successful_downloads = vec![];
         let mut rejected_tracks = vec![];
         let mut handles = vec![];
         while let Some(track) = receiver.recv().await {
+            database_manager
+                .load_item_to_database(&track)
+                .context("Load into database")?;
             match track {
                 Track::Query(search_item) => {
                     let managers = Arc::clone(&managers);
                     let sender = Arc::clone(&sender);
-                    let semaphore = download_semaphore.clone();
+                    let semaphore = search_semaphore.clone();
                     tracing::info!(?search_item, "Enter search_item");
                     let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                         managers
@@ -192,7 +218,7 @@ impl Managers {
                     let sender = Arc::clone(&sender);
                     tracing::info!(?judge_submission, "Enter downloadable");
                     let judge_sub = judge_submission.clone();
-                    if !state.read().await.contains(&judge_submission) {
+                    if !state.read().await.contains(&judge_submission.track) {
                         let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                             managers
                                 .download_manager
@@ -212,7 +238,7 @@ impl Managers {
                             .context("sending rejected_tracks")?;
                     }
                     let mut write = state.write().await;
-                    write.push(judge_submission);
+                    write.push(judge_submission.track);
                 }
                 Track::File(downloaded_file) => {
                     tracing::info!(?downloaded_file, "Downloaded file");
@@ -230,7 +256,7 @@ impl Managers {
                         send(Track::Reject(reject), &sender)
                             .await
                             .context("rejecting")?;
-                        break;
+                        continue;
                     }
                     retry_request.retry_attempts += 1;
                     let managers = Arc::clone(&managers);

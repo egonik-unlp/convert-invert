@@ -1,5 +1,6 @@
 use crate::internals::{
     context::context_manager::{Track, send},
+    database::schema,
     parsing::deserialize::Playlist,
 };
 use anyhow::Context;
@@ -23,22 +24,22 @@ const TIMES_WITH_NO_NEW_FILES: usize = 3;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
-    pub id: u64,
+    pub track_id: i32,
     pub track: String,
     pub album: String,
     pub artist: String,
 }
 impl SearchItem {
-    fn new(track: String, album: String, artist: String) -> Self {
-        let id = {
+    pub fn new(track: String, album: String, artist: String) -> Self {
+        let track_id = {
             let mut s = DefaultHasher::new();
             track.hash(&mut s);
             album.hash(&mut s);
             artist.hash(&mut s);
             s.finish()
-        };
+        } as i32;
         SearchItem {
-            id,
+            track_id,
             track,
             album,
             artist,
@@ -75,7 +76,7 @@ impl From<Playlist> for Vec<SearchItem> {
 pub struct DownloadableFile {
     pub filename: String,
     pub username: String,
-    pub size: u64,
+    pub size: i32,
 }
 impl Display for SearchItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -107,7 +108,7 @@ impl SearchManager {
             .map(|f| JudgeSubmission {
                 query: DownloadableFile {
                     filename: f.name,
-                    size: f.size,
+                    size: f.size as i32,
                     username: f.username,
                 },
                 track: track.clone(),
@@ -137,7 +138,7 @@ impl SearchManager {
     name = "track_search_task",
     skip(client ),
     fields(
-        id = data.id,
+        id = data.track_id,
         query = ?data.track,
     )
 )]

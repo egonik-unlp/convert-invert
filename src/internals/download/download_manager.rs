@@ -62,7 +62,7 @@ impl DownloadManager {
 }
 
 #[tracing::instrument(name = "DownloadManager::download_track", skip(song, path, client), fields(
-    id = song.track.id,
+    id = song.track.track_id,
     song_name = song.query.filename,
     user_name = song.query.username,
 ))]
@@ -77,7 +77,7 @@ async fn download_track(
     let rec = client.download(
         song.query.filename.clone(),
         song.query.username.clone(),
-        song.query.size,
+        song.query.size as u64,
         path_str.to_string(),
     )?;
     let span = tracing::info_span!("download_thread_inner");

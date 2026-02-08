@@ -2,10 +2,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::Sender;
-use tracing::instrument;
 
 use crate::internals::{
     context::context_manager::{RejectReason, RejectedTrack, Track, send},

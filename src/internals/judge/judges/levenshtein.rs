@@ -15,7 +15,7 @@ impl Levenshtein {
 
 #[async_trait]
 impl Judge for Levenshtein {
-    #[instrument(name = "Levenshtein::judge", skip(self, submission), fields(id=submission.track.id,username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
+    #[instrument(name = "Levenshtein::judge", skip(self, submission), fields(id=submission.track.track_id,username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
     async fn judge(&self, submission: JudgeSubmission) -> anyhow::Result<bool> {
         let distance = str_distance::Levenshtein::default();
         let a = format!("{}", submission.track);
@@ -25,7 +25,7 @@ impl Judge for Levenshtein {
         let val = distance_val > self.score_cutoff as f64;
         Ok(val)
     }
-    #[instrument(name = "Levenshtein::judge_score", skip(self,submission), fields(id=submission.track.id,username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
+    #[instrument(name = "Levenshtein::judge_score", skip(self,submission), fields(id=submission.track.track_id,username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
     async fn judge_score(&self, submission: JudgeSubmission) -> anyhow::Result<f32> {
         let distance = str_distance::Levenshtein::default();
         let a = format!("{}", submission.track);

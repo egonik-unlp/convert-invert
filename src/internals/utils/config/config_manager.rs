@@ -13,6 +13,8 @@ pub struct Config {
     pub judge_score_llm: Option<f32>,
     pub listen_port: u32,
     pub search_timeout_secs: u8,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
 }
 
 impl Config {
@@ -22,6 +24,8 @@ impl Config {
         let log_level: EnvFilter = env::var("LOG_LEVEL").unwrap_or("debug".to_string()).into();
         let user_name = env::var("USER_NAME").unwrap_or("default".to_string());
         let user_password = env::var("USER_NAME").unwrap_or("123456".to_string());
+        let client_id = env::var("CLIENT_ID").ok();
+        let client_secret = env::var("CLIENT_SECRET").ok();
         let judge_score_levenshtein: Option<f32> = {
             let val = env::var("JUDGE_SCORE_LEVENSHTEIN").ok();
             val.map(|v| v.parse().expect("Cannot parse judge score levenshtein"))
@@ -48,6 +52,8 @@ impl Config {
             judge_score_llm,
             listen_port,
             search_timeout_secs,
+            client_id,
+            client_secret,
         })
     }
 
@@ -62,6 +68,8 @@ impl Config {
         listen_port: u32,
         search_timeout_secs: u8,
         run_id: String,
+        client_id: Option<String>,
+        client_secret: Option<String>,
     ) -> Self {
         Config {
             run_id,
@@ -72,6 +80,8 @@ impl Config {
             judge_score_llm,
             listen_port,
             search_timeout_secs,
+            client_id,
+            client_secret,
         }
     }
 }
