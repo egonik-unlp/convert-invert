@@ -38,6 +38,7 @@ diesel::table! {
         id -> Int4,
         track -> Int4,
         reason -> RejectReason,
+        value -> Nullable<Varchar>,
     }
 }
 

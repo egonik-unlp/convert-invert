@@ -1,4 +1,3 @@
-
 version: "3.8"
 
 services:
@@ -14,3 +13,19 @@ services:
     image: grafana/grafana:latest
     ports:
       - "5000:3000"
+    environment:
+        GF_SECURITY_ADMIN_USER: egonik
+        GF_SECURITY_ADMIN_PASSWORD: HisPro10
+  db:
+    image: postgres
+    restart: always
+    shm_size: 128mb
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - 5455:5432
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - 8080:8080

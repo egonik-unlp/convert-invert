@@ -1,17 +1,16 @@
-use crate::internals::database::{manager::DatabaseManager, schema};
+use crate::internals::database::manager::DatabaseManager;
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
-    fs::OpenOptions,
-    io::AsyncWriteExt,
     sync::{
         RwLock, Semaphore,
-        mpsc::{Receiver, Sender},
+        mpsc::{self, Receiver, Sender},
     },
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
+use tracing::instrument;
 
 use anyhow::Context;
 
@@ -111,6 +110,11 @@ impl RunTools {
     }
 }
 
+pub enum QueuePriority {
+    NormalRun(JoinHandle<anyhow::Result<()>>),
+    RetryRun(JoinHandle<anyhow::Result<()>>),
+}
+
 impl Managers {
     pub fn new(score: Option<f32>, path: PathBuf, config: Config) -> Self {
         let client_settings = ClientSettings {
@@ -151,6 +155,8 @@ impl Managers {
         }
         Ok(sender)
     }
+
+    #[instrument(name = "run-cyle", skip(self, sender, receiver, connection))]
     pub async fn run_cycle(
         self,
         sender: Sender<Track>,
@@ -164,17 +170,20 @@ impl Managers {
         let sender = Arc::new(sender);
         let storage = Vec::new();
         let state = Arc::new(RwLock::new(storage));
-        let tracks = managers.query_manager.run().await.context("Query")?;
-        for track in tracks {
-            send(track, &sender).await?;
-        }
+        let (task_sender, task_receiver) = mpsc::channel(300);
 
-        let search_semaphore = Arc::new(Semaphore::new(3));
+        let search_semaphore = Arc::new(Semaphore::new(4));
         let download_semaphore = Arc::new(Semaphore::new(5));
-        let mut successful_downloads = vec![];
-        let mut rejected_tracks = vec![];
-        let mut handles = vec![];
+        let task_manager: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            await_pending_tasks(task_receiver)
+                .await
+                .context("Awaiting tasks")?;
+            Ok(())
+        });
+
         while let Some(track) = receiver.recv().await {
+            tracing::info!(?track, "Incoming package");
+            let task_queue = task_sender.clone();
             database_manager
                 .load_item_to_database(&track)
                 .context("Load into database")?;
@@ -196,7 +205,10 @@ impl Managers {
                         Ok(())
                     });
                     tokio::time::sleep(Duration::from_secs(3)).await;
-                    handles.push(handle);
+                    task_queue
+                        .send(QueuePriority::NormalRun(handle))
+                        .await
+                        .context("Submitting task to queue")?;
                 }
                 Track::Result(judge_submission) => {
                     let managers = Arc::clone(&managers);
@@ -227,7 +239,10 @@ impl Managers {
                                 .context("Downloading")?;
                             Ok(())
                         });
-                        handles.push(handle);
+                        task_queue
+                            .send(QueuePriority::NormalRun(handle))
+                            .await
+                            .context("Submitting task to queue")?;
                     } else {
                         let reject = RejectedTrack::new(
                             judge_submission.clone(),
@@ -242,13 +257,9 @@ impl Managers {
                 }
                 Track::File(downloaded_file) => {
                     tracing::info!(?downloaded_file, "Downloaded file");
-                    successful_downloads.push(downloaded_file);
-                    dump_a_vec(&successful_downloads, "successes.json".into())
-                        .await
-                        .context("dumping succ")?;
                 }
                 Track::Retry(mut retry_request) => {
-                    if retry_request.retry_attempts >= 3 {
+                    if retry_request.retry_attempts >= 1 {
                         let reject = RejectedTrack::new(
                             retry_request.request,
                             RejectReason::AbandonedAttemptingSearch,
@@ -267,44 +278,43 @@ impl Managers {
                     let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                         managers
                             .search_manager
-                            .run(search_item.track, 5, semaphore, sender)
+                            .run(search_item.track, 1, semaphore, sender)
                             .await
                             .context("returning track")?;
                         Ok(())
                     });
-                    handles.push(handle);
+                    task_queue
+                        .send(QueuePriority::RetryRun(handle))
+                        .await
+                        .context("Submitting task to queue")?;
                     tracing::info!(?retry_request, "Retry requestedfile")
                 }
-                Track::Reject(rejected_track) => {
-                    rejected_tracks.push(rejected_track);
-                    dump_a_vec(&rejected_tracks, "rejects_dump.json".into())
-                        .await
-                        .context("dumping")?
-                }
+                Track::Reject(_rejected_track) => {}
             };
         }
-        tracing::info!(?successful_downloads, "Finished all");
-        for handle in handles {
-            handle.await.context("Threads joining")?.context("inner")?;
-        }
+        task_manager.await.context("Awaiting")?.context("Inner")?;
         Ok(())
     }
 }
 
-async fn dump_a_vec<T>(data: &T, filename: String) -> anyhow::Result<()>
-where
-    T: Serialize,
-{
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(filename)
-        .await
-        .context("Creating rejects file")?;
-    let string = serde_json::to_string(data).context("Deserializing rejected track")?;
-    file.write_all(string.as_bytes())
-        .await
-        .context("writing rejects")?;
+pub async fn await_pending_tasks(mut receiver: Receiver<QueuePriority>) -> anyhow::Result<()> {
+    let mut set = JoinSet::new();
+    let mut retries_queue = vec![];
+    while let Some(msg) = receiver.recv().await {
+        match msg {
+            QueuePriority::NormalRun(join_handle) => {
+                set.spawn(async move { join_handle.await.context("Awaiting handle")? });
+            }
+            QueuePriority::RetryRun(join_handle) => retries_queue.push(join_handle),
+        }
+    }
+
+    while let Some(res) = set.join_next().await {
+        res.context("Failed returning from task")?
+            .context("inner")?;
+    }
+    for task in retries_queue {
+        task.await.context("Awaiting retry")?.context("inner")?;
+    }
     Ok(())
 }

@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, Ok};
 use diesel::{PgConnection, dsl::insert_into, prelude::*};
 
 use crate::internals::context::context_manager::{RejectedTrack, RetryRequest, Track};
@@ -41,12 +41,27 @@ impl<'a> DatabaseManager<'a> {
             .context("Insert downloadable file")?;
         Ok(inserted_id)
     }
+    fn get_downloadable_file_id(
+        connection: &mut PgConnection,
+        downloadable_file: &RuntimeDownloadableFile,
+    ) -> anyhow::Result<i32> {
+        use schema::downloadable_files::dsl as df;
+        let downloadable_id = schema::downloadable_files::table
+            .filter(df::filename.eq(&downloadable_file.filename))
+            // .filter(df::username.eq(&downloadable_file.username))
+            // .filter(df::size.eq(&downloadable_file.size))
+            .select(df::id)
+            .get_result(connection)
+            .context("fetch download id from database at get down file id")?;
+        Ok(downloadable_id)
+    }
 
     fn insert_judge_submission(
         connection: &mut PgConnection,
         judge_submission: &RuntimeJudgeSubmission,
     ) -> anyhow::Result<i32> {
-        let track_id = Self::insert_search_item(connection, &judge_submission.track)?;
+        use schema::judge_submissions::dsl as js;
+        let track_id = Self::get_search_item_id(connection, &judge_submission.track)?;
         let query_id = Self::insert_downloadable_file(connection, &judge_submission.query)?;
         let value = model::NewJudgeSubmissionRow {
             track: track_id,
@@ -54,19 +69,37 @@ impl<'a> DatabaseManager<'a> {
         };
         let inserted_id = insert_into(schema::judge_submissions::table)
             .values(&value)
-            .returning(schema::judge_submissions::id)
+            .returning(js::id)
             .get_result(connection)
             .context("Insert judge submission")?;
         Ok(inserted_id)
+    }
+    fn get_judge_submission_id(
+        connection: &mut PgConnection,
+        judge_submission: &RuntimeJudgeSubmission,
+    ) -> anyhow::Result<i32> {
+        use schema::judge_submissions::dsl as js;
+        use schema::search_items::dsl as si;
+        let search_id: i32 = schema::search_items::table
+            .filter(si::track_id.eq(judge_submission.track.track_id))
+            .select(si::id)
+            .get_result(connection)
+            .context("fetch search id from db JSGet")?;
+        let judge_id = schema::judge_submissions::table
+            .filter(js::track.eq(search_id))
+            .select(js::id)
+            .get_result(connection)
+            .context("fetch judge id from db JSGET")?;
+        Ok(judge_id)
     }
 
     fn insert_retry_request(
         connection: &mut PgConnection,
         retry_request: &RetryRequest,
     ) -> anyhow::Result<()> {
-        let request_id = Self::insert_judge_submission(connection, &retry_request.request)?;
+        let request_id = Self::get_judge_submission_id(connection, &retry_request.request)?;
         let failed_download_result =
-            Self::insert_downloadable_file(connection, &retry_request.failed_download_result)?;
+            Self::get_downloadable_file_id(connection, &retry_request.failed_download_result)?;
         let value = model::NewRetryRequestRow {
             request: request_id,
             retry_attempts: i32::from(retry_request.retry_attempts),
@@ -84,13 +117,25 @@ impl<'a> DatabaseManager<'a> {
         rejected_track: &RejectedTrack,
     ) -> anyhow::Result<()> {
         let (judge_submission, _) = rejected_track.parts();
-        let track_id = Self::insert_judge_submission(connection, judge_submission)?;
+        let track_id = Self::get_judge_submission_id(connection, judge_submission)?;
         let value = model::NewRejectedTrackRow::from_runtime(track_id, rejected_track);
         insert_into(schema::rejected_track::table)
             .values(&value)
             .execute(connection)
             .context("Insert rejected track")?;
         Ok(())
+    }
+    fn get_search_item_id(
+        connection: &mut PgConnection,
+        search_item: &RuntimeSearchItem,
+    ) -> anyhow::Result<i32> {
+        use schema::search_items::dsl as sl;
+        let search_id = schema::search_items::table
+            .filter(sl::track_id.eq(search_item.track_id))
+            .select(schema::search_items::id)
+            .get_result(connection)
+            .context("database fetch search_id in get seatch id func")?;
+        Ok(search_id)
     }
 
     pub fn load_item_to_database(&mut self, item: &Track) -> anyhow::Result<()> {

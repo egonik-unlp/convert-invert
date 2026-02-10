@@ -213,9 +213,7 @@ impl From<RetryRequestJoined> for RetryRequest {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, AsExpression, FromSqlRow,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, AsExpression, FromSqlRow)]
 #[diesel(sql_type = sql_types::RejectReason)]
 pub enum RejectReasonRow {
     AlreadyDownloaded,
@@ -298,6 +296,7 @@ pub struct RejectedTrackRow {
 pub struct NewRejectedTrackRow {
     pub track: i32,
     pub reason: RejectReasonRow,
+    pub value: Option<String>,
 }
 
 impl NewRejectedTrackRow {
@@ -306,6 +305,12 @@ impl NewRejectedTrackRow {
         Self {
             track: track_id,
             reason: reason.into(),
+            value: match reason {
+                RuntimeRejectReason::AlreadyDownloaded
+                | RuntimeRejectReason::AbandonedAttemptingSearch => None,
+                RuntimeRejectReason::LowScore(score) => Some(format!("{score}")),
+                RuntimeRejectReason::NotMusic(filename) => Some(filename.to_owned()),
+            },
         }
     }
 }

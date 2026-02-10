@@ -10,7 +10,7 @@ use convert_invert::internals::{
 };
 
 use convert_invert::internals::database::establish_connection;
-#[instrument]
+#[instrument(name = "main-span")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let connection = &mut establish_connection();
@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
     };
     config.run_id = format!("{}_attempt_{}", config.run_id, attempt_num);
 
-    trace::otel_trace::init_tracing_with_otel("convert_invert".to_string(), config.run_id.clone())
+    trace::otel_trace::init_tracing_with_otel("convert-invert".to_string(), config.run_id.clone())
         .context("Tracing")?;
 
     let download_path =
