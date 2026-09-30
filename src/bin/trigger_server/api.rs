@@ -2,10 +2,14 @@ use std::collections::{HashMap, HashSet};
 
 use actix_web::{HttpResponse, get, post, web};
 use convert_invert::internals::context::context_manager::RedisPool;
-use convert_invert::internals::context::context_manager::WorkerTuning;
+use convert_invert::internals::context::context_manager::{
+    JUDGE_BACKEND_KEY, JUDGE_URL_KEY, WorkerTuning, judge_settings_from_env,
+    normalize_judge_backend, resolve_judge_settings,
+};
 use convert_invert::internals::database::DbPool;
 use convert_invert::internals::database::schema;
 use convert_invert::internals::judge::judge_manager::JUDGE_THRESHOLD;
+use convert_invert::internals::judge::judges::smol;
 use convert_invert::internals::query::query_manager::{QueryManager, ResourceKind};
 use convert_invert::internals::utils::config::config_manager::Config;
 use diesel::prelude::*;
@@ -16,6 +20,14 @@ use serde::{Deserialize, Serialize};
 use crate::errors::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::validation::PlaylistQuery;
+
+/// The LLM judge's taxonomy, best verdict first. The UI orders its label
+/// filters and its stacked distribution bar by this.
+const JUDGE_LABELS: [&str; 4] = ["exact", "wrong_version", "wrong_artist", "different"];
+
+/// Page size for the judgements feed when the caller does not ask for one.
+const JUDGEMENTS_DEFAULT_LIMIT: i64 = 100;
+const JUDGEMENTS_MAX_LIMIT: i64 = 500;
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -100,6 +112,92 @@ pub struct CandidateResponse {
     pub score: f32,
     #[serde(rename = "relativeMiScore")]
     pub relative_mi_score: Option<f32>,
+    /// The deciding judge's label, hoisted out of `judgements` so the UI can
+    /// group candidates by verdict without digging.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Every judge's verdict on this candidate, newest judge first.
+    pub judgements: Vec<JudgementResponse>,
+}
+
+/// One judge's verdict, as the UI sees it.
+#[derive(Serialize, Clone)]
+pub struct JudgementResponse {
+    pub id: i32,
+    pub judge: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub score: f32,
+    pub accepted: bool,
+    #[serde(rename = "latencyMs")]
+    pub latency_ms: i32,
+    #[serde(rename = "promptVersion", skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Unix seconds. The judgements feed orders on this.
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+}
+
+/// A verdict plus the track and file it is about — the row shape of the
+/// judgements feed, which is read across tracks rather than within one.
+#[derive(Serialize)]
+pub struct JudgementFeedItem {
+    #[serde(flatten)]
+    pub judgement: JudgementResponse,
+    #[serde(rename = "submissionId")]
+    pub submission_id: i32,
+    #[serde(rename = "trackDbId")]
+    pub track_db_id: i32,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub filename: String,
+    pub username: String,
+}
+
+#[derive(Serialize)]
+pub struct JudgementLabelCount {
+    pub label: String,
+    pub count: i64,
+}
+
+#[derive(Serialize)]
+pub struct JudgementJudgeSummary {
+    pub judge: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub count: i64,
+    pub accepted: i64,
+    pub errors: i64,
+    #[serde(rename = "avgLatencyMs")]
+    pub avg_latency_ms: i32,
+}
+
+#[derive(Serialize)]
+pub struct JudgementSummary {
+    pub total: i64,
+    pub accepted: i64,
+    pub errors: i64,
+    #[serde(rename = "avgLatencyMs")]
+    pub avg_latency_ms: i32,
+    #[serde(rename = "p95LatencyMs")]
+    pub p95_latency_ms: i32,
+    pub labels: Vec<JudgementLabelCount>,
+    pub judges: Vec<JudgementJudgeSummary>,
+}
+
+#[derive(Serialize)]
+pub struct JudgementsResponse {
+    pub summary: JudgementSummary,
+    pub items: Vec<JudgementFeedItem>,
+    #[serde(rename = "nextCursor", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -238,8 +336,35 @@ pub struct LogEntry {
 pub struct ConfigResponse {
     #[serde(rename = "judgeThreshold")]
     pub judge_threshold: f32,
+    pub judge: JudgeConfig,
     pub auth: AuthConfig,
     pub tuning: TuningConfig,
+}
+
+/// Which judge is actually scoring candidates, so the UI can say so rather than
+/// implying every run was judged the same way.
+#[derive(Serialize)]
+pub struct JudgeConfig {
+    /// `levenshtein` or `smol-judge`.
+    pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// True once the backend is an LLM, which is what unlocks the label-based UI.
+    #[serde(rename = "isLlm")]
+    pub is_llm: bool,
+    /// The label taxonomy the judge can emit, in severity order. Empty for
+    /// judges that only produce a number.
+    pub labels: Vec<String>,
+    /// The ollama the judge talks to. Only meaningful for the LLM backend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// `env` (from the deployment's configuration) or `override` (switched from
+    /// the dashboard).
+    pub source: String,
+    /// What the deployment would fall back to if the override were cleared, so
+    /// the UI can offer a meaningful "reset".
+    #[serde(rename = "envBackend")]
+    pub env_backend: String,
 }
 
 #[derive(Serialize)]
@@ -364,6 +489,103 @@ struct CandidateQueryRow {
     score: Option<f32>,
     #[diesel(sql_type = Nullable<Float4>)]
     relative_mi_score: Option<f32>,
+}
+
+/// A judgement row joined to the track and file it judged. `created_at` is
+/// selected as epoch seconds so no chrono/timestamp mapping is needed on the
+/// Rust side, and the frontend gets the same number shape it uses elsewhere.
+#[derive(QueryableByName)]
+struct JudgementRow {
+    #[diesel(sql_type = Integer)]
+    id: i32,
+    #[diesel(sql_type = Integer)]
+    submission_id: i32,
+    #[diesel(sql_type = Text)]
+    judge: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    model: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    label: Option<String>,
+    #[diesel(sql_type = Float4)]
+    score: f32,
+    #[diesel(sql_type = Bool)]
+    accepted: bool,
+    #[diesel(sql_type = Integer)]
+    latency_ms: i32,
+    #[diesel(sql_type = Nullable<Text>)]
+    prompt_version: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    raw: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    error: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    created_at: i64,
+}
+
+impl JudgementRow {
+    fn into_response(self) -> JudgementResponse {
+        JudgementResponse {
+            id: self.id,
+            judge: self.judge,
+            model: self.model,
+            label: self.label,
+            score: self.score,
+            accepted: self.accepted,
+            latency_ms: self.latency_ms,
+            prompt_version: self.prompt_version,
+            raw: self.raw,
+            error: self.error,
+            created_at: self.created_at,
+        }
+    }
+}
+
+#[derive(QueryableByName)]
+struct JudgementFeedRow {
+    #[diesel(embed)]
+    judgement: JudgementRow,
+    #[diesel(sql_type = Integer)]
+    track_db_id: i32,
+    #[diesel(sql_type = Text)]
+    title: String,
+    #[diesel(sql_type = Text)]
+    artist: String,
+    #[diesel(sql_type = Text)]
+    album: String,
+    #[diesel(sql_type = Text)]
+    filename: String,
+    #[diesel(sql_type = Text)]
+    username: String,
+}
+
+#[derive(QueryableByName)]
+struct JudgementSummaryRow {
+    #[diesel(sql_type = Text)]
+    judge: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    model: Option<String>,
+    #[diesel(sql_type = Nullable<Text>)]
+    label: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    accepted: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    errors: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    latency_total: i64,
+    /// Only judgements that actually took measurable time. Averaging a model's
+    /// 200ms against a string comparison's 0ms describes neither.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    latency_count: i64,
+}
+
+/// Latency percentile over the whole filtered set. Separate from the grouped
+/// summary because a percentile of per-group percentiles is not a percentile.
+#[derive(QueryableByName)]
+struct JudgementLatencyRow {
+    #[diesel(sql_type = Integer)]
+    p95_latency_ms: i32,
 }
 
 #[derive(QueryableByName)]
@@ -935,6 +1157,116 @@ pub async fn network(state: web::Data<AppState>) -> impl actix_web::Responder {
     })
 }
 
+/// Workers run in this process, so the same environment that picks the judge is
+/// the one reported here — the answer cannot drift from what actually ran.
+fn judge_config(state: &AppState) -> JudgeConfig {
+    // Workers run in this process against the same Redis, so what is reported
+    // here is what the next run will actually use.
+    let settings = resolve_judge_settings(&state.redis_pool);
+    let is_llm = settings.backend == smol::JUDGE_NAME;
+    JudgeConfig {
+        model: is_llm.then(|| settings.model.clone()),
+        labels: if is_llm {
+            JUDGE_LABELS.iter().map(|label| label.to_string()).collect()
+        } else {
+            Vec::new()
+        },
+        url: is_llm.then(|| settings.url.clone()),
+        source: settings.source.to_string(),
+        env_backend: judge_settings_from_env().backend,
+        backend: settings.backend,
+        is_llm,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct JudgeSwitchBody {
+    /// `levenshtein` | `smol` (and the usual aliases).
+    pub backend: String,
+    /// Ollama base URL, for the LLM backend. Omitted leaves the current one.
+    pub url: Option<String>,
+}
+
+/// Switches the judge at runtime.
+///
+/// The point of this is that the right judge depends on what else the box is
+/// doing: the model is ~100x slower on a machine that is busy training, so being
+/// able to move it to an idle host — or back to Levenshtein — should not require
+/// editing the deployment and recreating containers.
+///
+/// Takes effect on the next run: the judge is built when a worker starts, so a
+/// run already in flight keeps the judge it began with.
+#[post("/judge")]
+pub async fn judge_switch(
+    state: web::Data<AppState>,
+    body: web::Json<JudgeSwitchBody>,
+) -> ApiResult<HttpResponse> {
+    let backend = normalize_judge_backend(&body.backend)
+        .ok_or_else(|| ApiError::BadRequest(format!("Unknown judge backend '{}'", body.backend)))?;
+
+    let url = match body.url.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(url) => Some(validate_judge_url(url)?),
+    };
+
+    let mut con = state
+        .redis_pool
+        .get()
+        .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
+    let _: () = con
+        .set(JUDGE_BACKEND_KEY, backend)
+        .map_err(|err| ApiError::Internal(format!("redis set: {err}")))?;
+    if let Some(url) = &url {
+        let _: () = con
+            .set(JUDGE_URL_KEY, url.as_str())
+            .map_err(|err| ApiError::Internal(format!("redis set: {err}")))?;
+    }
+    tracing::info!(
+        backend,
+        url = url.as_deref().unwrap_or("-"),
+        "Judge switched"
+    );
+
+    Ok(HttpResponse::Ok().json(judge_config(&state)))
+}
+
+/// Drops the override, returning the judge to whatever the deployment configures.
+#[post("/judge/reset")]
+pub async fn judge_reset(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+    let mut con = state
+        .redis_pool
+        .get()
+        .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
+    let _: () = con
+        .del(&[JUDGE_BACKEND_KEY, JUDGE_URL_KEY][..])
+        .map_err(|err| ApiError::Internal(format!("redis del: {err}")))?;
+    tracing::info!("Judge override cleared; reverting to the configured judge");
+    Ok(HttpResponse::Ok().json(judge_config(&state)))
+}
+
+/// An operator-supplied URL reaches the judge's HTTP client, so it is checked
+/// rather than trusted: http(s) only, with a host, and no embedded credentials.
+fn validate_judge_url(url: &str) -> Result<String, ApiError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|err| ApiError::BadRequest(format!("Invalid judge URL: {err}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::BadRequest(
+            "Judge URL must be http or https".to_string(),
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err(ApiError::BadRequest(
+            "Judge URL must include a host".to_string(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ApiError::BadRequest(
+            "Judge URL must not embed credentials".to_string(),
+        ));
+    }
+    Ok(url.trim_end_matches('/').to_string())
+}
+
 #[get("/config")]
 pub async fn config(state: web::Data<AppState>) -> impl actix_web::Responder {
     let tuning = WorkerTuning::from_env();
@@ -955,6 +1287,7 @@ pub async fn config(state: web::Data<AppState>) -> impl actix_web::Responder {
     .to_string();
     HttpResponse::Ok().json(ConfigResponse {
         judge_threshold: JUDGE_THRESHOLD,
+        judge: judge_config(&state),
         auth: AuthConfig {
             scheme: "api_key",
             header: "X-API-Key",
@@ -1224,18 +1557,270 @@ pub async fn candidates(
     )
     .bind::<Integer, _>(*path)
     .load::<CandidateQueryRow>(&mut connection)?;
+
+    // One extra query for the whole page rather than one per candidate.
+    let by_submission = judgements_by_submission(&mut connection, *path)?;
+
     let response = rows
         .into_iter()
-        .map(|row| CandidateResponse {
-            id: row.submission_id,
-            file_id: row.file_id,
-            username: row.username,
-            filename: row.filename,
-            score: row.score.unwrap_or(0.0),
-            relative_mi_score: row.relative_mi_score,
+        .map(|row| {
+            let verdicts = by_submission
+                .get(&row.submission_id)
+                .cloned()
+                .unwrap_or_default();
+            CandidateResponse {
+                id: row.submission_id,
+                file_id: row.file_id,
+                username: row.username,
+                filename: row.filename,
+                score: row.score.unwrap_or(0.0),
+                relative_mi_score: row.relative_mi_score,
+                // The deciding verdict is the labelled one; number-only judges
+                // (levenshtein, relative_mi) have nothing to hoist.
+                label: verdicts.iter().find_map(|verdict| verdict.label.clone()),
+                judgements: verdicts,
+            }
         })
         .collect::<Vec<_>>();
     Ok(HttpResponse::Ok().json(response))
+}
+
+/// Every judgement for one track's candidates, keyed by submission id.
+fn judgements_by_submission(
+    connection: &mut PgConnection,
+    track_db_id: i32,
+) -> Result<HashMap<i32, Vec<JudgementResponse>>, ApiError> {
+    let rows = diesel::sql_query(
+        r#"
+            SELECT j.id, j.submission AS submission_id, j.judge, j.model, j.label, j.score,
+                   j.accepted, j.latency_ms, j.prompt_version, j.raw, j.error,
+                   EXTRACT(EPOCH FROM j.created_at)::bigint AS created_at
+            FROM judgements j
+            JOIN judge_submissions js ON j.submission = js.id
+            WHERE js.track = $1
+            -- Labelled verdicts first, so the deciding judge leads each candidate.
+            ORDER BY j.submission, (j.label IS NULL), j.judge
+        "#,
+    )
+    .bind::<Integer, _>(track_db_id)
+    .load::<JudgementRow>(connection)?;
+
+    let mut grouped: HashMap<i32, Vec<JudgementResponse>> = HashMap::new();
+    for row in rows {
+        grouped
+            .entry(row.submission_id)
+            .or_default()
+            .push(row.into_response());
+    }
+    Ok(grouped)
+}
+
+#[derive(Deserialize)]
+pub struct JudgementsQuery {
+    pub limit: Option<i64>,
+    /// Keyset cursor: the `id` of the last item of the previous page.
+    pub cursor: Option<i32>,
+    pub judge: Option<String>,
+    pub label: Option<String>,
+    pub accepted: Option<bool>,
+}
+
+/// Every judge's verdict, newest first, with a summary over the same filters.
+///
+/// The library view answers "what happened to this track"; this answers the
+/// question a judge-based pipeline raises instead — how is the judge ruling
+/// overall, how often does it accept, how fast is it, and is it erroring.
+#[get("/judgements")]
+pub async fn judgements(
+    state: web::Data<AppState>,
+    query: web::Query<JudgementsQuery>,
+) -> ApiResult<HttpResponse> {
+    let limit = query
+        .limit
+        .unwrap_or(JUDGEMENTS_DEFAULT_LIMIT)
+        .clamp(1, JUDGEMENTS_MAX_LIMIT);
+    // Empty strings arrive from cleared UI filters; treat them as "no filter".
+    let judge = query.judge.as_deref().filter(|value| !value.is_empty());
+    let label = query.label.as_deref().filter(|value| !value.is_empty());
+    let accepted = query.accepted;
+
+    let mut connection = state.db_pool.get()?;
+
+    let rows = diesel::sql_query(
+        r#"
+            SELECT j.id, j.submission AS submission_id, j.judge, j.model, j.label, j.score,
+                   j.accepted, j.latency_ms, j.prompt_version, j.raw, j.error,
+                   EXTRACT(EPOCH FROM j.created_at)::bigint AS created_at,
+                   si.id AS track_db_id, si.track AS title, si.artist, si.album,
+                   dlf.filename, dlf.username
+            FROM judgements j
+            JOIN judge_submissions js ON j.submission = js.id
+            JOIN search_items si ON js.track = si.id
+            JOIN downloadable_files dlf ON js.query = dlf.id
+            WHERE ($1::text IS NULL OR j.judge = $1)
+              AND ($2::text IS NULL OR j.label = $2)
+              AND ($3::bool IS NULL OR j.accepted = $3)
+              AND (
+                  $4::int IS NULL
+                  OR (j.created_at, j.id)
+                     < (SELECT c.created_at, c.id FROM judgements c WHERE c.id = $4)
+              )
+            ORDER BY j.created_at DESC, j.id DESC
+            LIMIT $5
+        "#,
+    )
+    .bind::<Nullable<Text>, _>(judge)
+    .bind::<Nullable<Text>, _>(label)
+    .bind::<Nullable<Bool>, _>(accepted)
+    .bind::<Nullable<Integer>, _>(query.cursor)
+    .bind::<diesel::sql_types::BigInt, _>(limit)
+    .load::<JudgementFeedRow>(&mut connection)?;
+
+    let next_cursor = (rows.len() as i64 == limit)
+        .then(|| rows.last().map(|row| row.judgement.id))
+        .flatten();
+
+    let items = rows
+        .into_iter()
+        .map(|row| JudgementFeedItem {
+            submission_id: row.judgement.submission_id,
+            judgement: row.judgement.into_response(),
+            track_db_id: row.track_db_id,
+            title: row.title,
+            artist: row.artist,
+            album: row.album,
+            filename: row.filename,
+            username: row.username,
+        })
+        .collect::<Vec<_>>();
+
+    // The summary covers the whole filtered set, not just the page — otherwise
+    // "92% exact" would silently mean "92% of the last 100".
+    let summary_rows = diesel::sql_query(
+        r#"
+            SELECT j.judge, j.model, j.label,
+                   COUNT(*) AS count,
+                   COUNT(*) FILTER (WHERE j.accepted) AS accepted,
+                   COUNT(*) FILTER (WHERE j.error IS NOT NULL) AS errors,
+                   COALESCE(SUM(j.latency_ms), 0)::bigint AS latency_total,
+                   COUNT(*) FILTER (WHERE j.latency_ms > 0) AS latency_count
+            FROM judgements j
+            WHERE ($1::text IS NULL OR j.judge = $1)
+              AND ($2::text IS NULL OR j.label = $2)
+              AND ($3::bool IS NULL OR j.accepted = $3)
+            GROUP BY j.judge, j.model, j.label
+        "#,
+    )
+    .bind::<Nullable<Text>, _>(judge)
+    .bind::<Nullable<Text>, _>(label)
+    .bind::<Nullable<Bool>, _>(accepted)
+    .load::<JudgementSummaryRow>(&mut connection)?;
+
+    let latency = diesel::sql_query(
+        r#"
+            SELECT COALESCE(
+                       percentile_disc(0.95) WITHIN GROUP (ORDER BY j.latency_ms), 0
+                   )::int AS p95_latency_ms
+            FROM judgements j
+            WHERE j.latency_ms > 0
+              AND ($1::text IS NULL OR j.judge = $1)
+              AND ($2::text IS NULL OR j.label = $2)
+              AND ($3::bool IS NULL OR j.accepted = $3)
+        "#,
+    )
+    .bind::<Nullable<Text>, _>(judge)
+    .bind::<Nullable<Text>, _>(label)
+    .bind::<Nullable<Bool>, _>(accepted)
+    .get_result::<JudgementLatencyRow>(&mut connection)?;
+
+    Ok(HttpResponse::Ok().json(JudgementsResponse {
+        summary: summarise_judgements(summary_rows, latency.p95_latency_ms),
+        items,
+        next_cursor,
+    }))
+}
+
+/// Folds the grouped counts into per-label and per-judge totals.
+fn summarise_judgements(rows: Vec<JudgementSummaryRow>, p95_latency_ms: i32) -> JudgementSummary {
+    let mut labels: HashMap<String, i64> = HashMap::new();
+    let mut judges: HashMap<String, JudgementJudgeSummary> = HashMap::new();
+    // (summed latency, number of timed judgements) per judge.
+    let mut latency_by_judge: HashMap<String, (i64, i64)> = HashMap::new();
+    let (mut total, mut accepted, mut errors) = (0i64, 0i64, 0i64);
+    let (mut latency_total, mut latency_count) = (0i64, 0i64);
+
+    for row in rows {
+        total += row.count;
+        accepted += row.accepted;
+        errors += row.errors;
+        latency_total += row.latency_total;
+        latency_count += row.latency_count;
+        if let Some(label) = row.label {
+            *labels.entry(label).or_default() += row.count;
+        }
+        let entry = judges
+            .entry(row.judge.clone())
+            .or_insert_with(|| JudgementJudgeSummary {
+                judge: row.judge.clone(),
+                model: row.model.clone(),
+                count: 0,
+                accepted: 0,
+                errors: 0,
+                avg_latency_ms: 0,
+            });
+        entry.count += row.count;
+        entry.accepted += row.accepted;
+        entry.errors += row.errors;
+        entry.model = entry.model.take().or(row.model);
+        let latency = latency_by_judge.entry(row.judge).or_default();
+        latency.0 += row.latency_total;
+        latency.1 += row.latency_count;
+    }
+
+    let mut judges = judges.into_values().collect::<Vec<_>>();
+    for judge in &mut judges {
+        let (total_ms, timed) = latency_by_judge
+            .get(&judge.judge)
+            .copied()
+            .unwrap_or((0, 0));
+        judge.avg_latency_ms = mean_ms(total_ms, timed);
+    }
+    judges.sort_by_key(|judge| std::cmp::Reverse(judge.count));
+
+    // Known labels in taxonomy order first, then anything unexpected, so the
+    // distribution bar keeps a stable colour order across polls.
+    let mut label_counts = JUDGE_LABELS
+        .iter()
+        .filter_map(|label| {
+            labels.remove(*label).map(|count| JudgementLabelCount {
+                label: (*label).to_string(),
+                count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut extra = labels
+        .into_iter()
+        .map(|(label, count)| JudgementLabelCount { label, count })
+        .collect::<Vec<_>>();
+    extra.sort_by_key(|label| std::cmp::Reverse(label.count));
+    label_counts.extend(extra);
+
+    JudgementSummary {
+        total,
+        accepted,
+        errors,
+        avg_latency_ms: mean_ms(latency_total, latency_count),
+        p95_latency_ms,
+        labels: label_counts,
+        judges,
+    }
+}
+
+fn mean_ms(total_ms: i64, count: i64) -> i32 {
+    if count <= 0 {
+        return 0;
+    }
+    (total_ms / count).clamp(0, i32::MAX as i64) as i32
 }
 
 #[get("/tracks/{id}/report")]
@@ -2006,9 +2591,10 @@ pub async fn resolve(
         base_config.search_timeout_secs,
     );
 
-    let resolved = query_manager.resolve(kind).await.map_err(|err| {
-        ApiError::BadRequest(format!("Could not resolve Spotify {kind}: {err}"))
-    })?;
+    let resolved = query_manager
+        .resolve(kind)
+        .await
+        .map_err(|err| ApiError::BadRequest(format!("Could not resolve Spotify {kind}: {err}")))?;
 
     Ok(HttpResponse::Ok().json(ResolveResponse {
         kind: resolved.kind.as_str().to_string(),
@@ -2297,9 +2883,140 @@ pub async fn cancel_download(
 
 #[cfg(test)]
 mod tests {
-    use super::{analyzed_trace_events, redis_progress_from_hash};
+    use super::{
+        JudgementSummaryRow, analyzed_trace_events, redis_progress_from_hash, summarise_judgements,
+    };
     use serde_json::json;
     use std::collections::HashMap;
+
+    fn summary_row(
+        judge: &str,
+        label: Option<&str>,
+        count: i64,
+        accepted: i64,
+        latency_total: i64,
+    ) -> JudgementSummaryRow {
+        JudgementSummaryRow {
+            judge: judge.to_string(),
+            model: Some("smol-judge:c200-q8".to_string()),
+            label: label.map(str::to_string),
+            count,
+            accepted,
+            errors: 0,
+            latency_total,
+            // Timed unless the judge reports no latency at all, like relative_mi.
+            latency_count: if latency_total > 0 { count } else { 0 },
+        }
+    }
+
+    #[test]
+    fn judgement_summary_orders_labels_by_taxonomy_not_by_count() {
+        let summary = summarise_judgements(
+            vec![
+                summary_row("smol-judge", Some("different"), 30, 0, 3_000),
+                summary_row("smol-judge", Some("exact"), 10, 10, 1_000),
+                summary_row("smol-judge", Some("wrong_version"), 5, 0, 500),
+            ],
+            220,
+        );
+
+        let labels: Vec<&str> = summary
+            .labels
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect();
+        assert_eq!(labels, vec!["exact", "wrong_version", "different"]);
+        assert_eq!(summary.total, 45);
+        assert_eq!(summary.accepted, 10);
+        assert_eq!(summary.avg_latency_ms, 100);
+        assert_eq!(summary.p95_latency_ms, 220);
+    }
+
+    #[test]
+    fn judgement_summary_averages_latency_per_judge() {
+        let summary = summarise_judgements(
+            vec![
+                summary_row("smol-judge", Some("exact"), 2, 2, 400),
+                summary_row("smol-judge", Some("different"), 2, 0, 100),
+                summary_row("relative_mi", None, 4, 1, 0),
+            ],
+            0,
+        );
+
+        let smol = summary
+            .judges
+            .iter()
+            .find(|judge| judge.judge == "smol-judge")
+            .expect("smol judge summary");
+        assert_eq!(smol.count, 4);
+        assert_eq!(smol.avg_latency_ms, 125);
+        // The instantaneous scalar judge must not drag the model's mean toward
+        // zero — its untimed rows are excluded from the average entirely.
+        assert_eq!(summary.avg_latency_ms, 125);
+        let relative_mi = summary
+            .judges
+            .iter()
+            .find(|judge| judge.judge == "relative_mi")
+            .expect("relative_mi summary");
+        assert_eq!(relative_mi.avg_latency_ms, 0);
+        // Number-only judges contribute no labels to the distribution.
+        assert_eq!(summary.labels.len(), 2);
+    }
+
+    #[test]
+    fn judge_url_accepts_the_hosts_the_switch_is_for() {
+        use super::validate_judge_url;
+
+        assert_eq!(
+            validate_judge_url("http://100.107.86.38:11434").expect("tailnet host"),
+            "http://100.107.86.38:11434",
+        );
+        // A trailing slash would double up when the path is appended.
+        assert_eq!(
+            validate_judge_url("http://host.docker.internal:11434/").expect("docker host"),
+            "http://host.docker.internal:11434",
+        );
+    }
+
+    #[test]
+    fn judge_url_rejects_what_should_not_reach_the_http_client() {
+        use super::validate_judge_url;
+
+        for bad in [
+            "not a url",
+            "ftp://ollama:11434",
+            "file:///etc/passwd",
+            "http://user:secret@ollama:11434",
+        ] {
+            assert!(
+                validate_judge_url(bad).is_err(),
+                "should have rejected {bad:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn judge_backend_names_normalise_to_the_two_real_judges() {
+        use convert_invert::internals::context::context_manager::normalize_judge_backend;
+
+        for alias in ["smol", "SMOL-JUDGE", " llm ", "ollama"] {
+            assert_eq!(normalize_judge_backend(alias), Some("smol-judge"));
+        }
+        assert_eq!(normalize_judge_backend("levenshtein"), Some("levenshtein"));
+        // An unknown name is rejected rather than silently becoming a default —
+        // a typo must not quietly switch the judge.
+        assert_eq!(normalize_judge_backend("gpt-5"), None);
+        assert_eq!(normalize_judge_backend(""), None);
+    }
+
+    #[test]
+    fn judgement_summary_of_nothing_does_not_divide_by_zero() {
+        let summary = summarise_judgements(Vec::new(), 0);
+
+        assert_eq!(summary.total, 0);
+        assert_eq!(summary.avg_latency_ms, 0);
+        assert!(summary.labels.is_empty());
+    }
 
     #[test]
     fn redis_progress_maps_queued_hash_as_active_zero_percent() {

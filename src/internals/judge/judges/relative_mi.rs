@@ -185,6 +185,10 @@ pub fn score_submission(submission: &JudgeSubmission) -> f32 {
 
 #[async_trait]
 impl Judge for RelativeMi {
+    fn name(&self) -> &'static str {
+        "relative_mi"
+    }
+
     async fn judge(&self, submission: JudgeSubmission) -> anyhow::Result<bool> {
         Ok(self.judge_score(submission).await? > 0.0)
     }
@@ -221,6 +225,7 @@ mod tests {
             },
             score: None,
             relative_mi_score: None,
+            judgements: Vec::new(),
         }
     }
 

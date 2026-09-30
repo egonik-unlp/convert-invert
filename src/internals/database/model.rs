@@ -13,6 +13,7 @@ use crate::internals::{
         DownloadedFile, RejectReason as RuntimeRejectReason, RejectedTrack, RetryRequest,
     },
     database::schema::{self, sql_types},
+    judge::judge_manager::Judgement as RuntimeJudgement,
     search::search_manager::{
         DownloadableFile as RuntimeDownloadableFile, JudgeSubmission as RuntimeJudgeSubmission,
         SearchItem as RuntimeSearchItem,
@@ -151,6 +152,52 @@ pub struct NewJudgeSubmissionRow {
     pub relative_mi_score: Option<f32>,
 }
 
+/// A verdict on its way into `judgements`. `created_at` is left to the column
+/// default so the database clock, not the worker's, orders the feed.
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = schema::judgements)]
+pub struct NewJudgementRow {
+    pub submission: i32,
+    pub judge: String,
+    pub model: Option<String>,
+    pub label: Option<String>,
+    pub score: f32,
+    pub accepted: bool,
+    pub latency_ms: i32,
+    pub prompt_version: Option<String>,
+    pub raw: Option<String>,
+    pub error: Option<String>,
+}
+
+impl NewJudgementRow {
+    pub fn from_runtime(submission: i32, value: &RuntimeJudgement) -> Self {
+        Self {
+            submission,
+            judge: value.judge.clone(),
+            model: value.model.clone(),
+            label: value.label.clone(),
+            score: value.score,
+            accepted: value.accepted,
+            latency_ms: value.latency_ms,
+            prompt_version: value.prompt_version.clone(),
+            // Bounded: a runaway reply must not turn the log into a blob store.
+            raw: value.raw.as_deref().map(truncate_detail),
+            error: value.error.as_deref().map(truncate_detail),
+        }
+    }
+}
+
+/// Longest judge reply / error kept verbatim. Enough for the JSON verdict and a
+/// readable error, short enough that a pathological reply cannot bloat the table.
+const MAX_DETAIL_CHARS: usize = 500;
+
+fn truncate_detail(value: &str) -> String {
+    if value.chars().count() <= MAX_DETAIL_CHARS {
+        return value.to_string();
+    }
+    value.chars().take(MAX_DETAIL_CHARS).collect::<String>() + "…"
+}
+
 #[derive(Debug, Clone)]
 pub struct JudgeSubmissionJoined {
     pub row: JudgeSubmissionRow,
@@ -165,6 +212,9 @@ impl From<JudgeSubmissionJoined> for RuntimeJudgeSubmission {
             query: value.query.into(),
             score: value.row.score,
             relative_mi_score: value.row.relative_mi_score,
+            // Verdicts live in their own table; a submission read back from the
+            // database is not carrying them anywhere.
+            judgements: Vec::new(),
         }
     }
 }

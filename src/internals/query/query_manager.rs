@@ -423,26 +423,36 @@ mod tests {
         };
 
         // "Rick Astley - Whenever You Need Somebody" album and its lead track; a public playlist.
-        let album: ResolvedResource = resolve("spotify:album:6N9PS4QXF1D0OWPk0Sxtb4", ResourceKind::Album)
-            .await
-            .expect("resolve album");
+        let album: ResolvedResource =
+            resolve("spotify:album:6N9PS4QXF1D0OWPk0Sxtb4", ResourceKind::Album)
+                .await
+                .expect("resolve album");
         assert!(!album.name.is_empty());
         assert!(album.image.is_some(), "album should have cover art");
         assert!(album.track_count.unwrap_or(0) > 0);
-        println!("ALBUM  -> {} · {} · {:?} tracks · {:?}", album.name, album.subtitle, album.track_count, album.image);
+        println!(
+            "ALBUM  -> {} · {} · {:?} tracks · {:?}",
+            album.name, album.subtitle, album.track_count, album.image
+        );
 
         let track = resolve("spotify:track:4PTG3Z6ehGkBFwjybzWkR8", ResourceKind::Track)
             .await
             .expect("resolve track");
         assert!(!track.name.is_empty());
         assert!(track.track_count.is_none());
-        println!("TRACK  -> {} · {} · {:?}", track.name, track.subtitle, track.image);
+        println!(
+            "TRACK  -> {} · {} · {:?}",
+            track.name, track.subtitle, track.image
+        );
 
         let playlist = resolve("1Y0xPsqLXBV9xy4imNGeDT", ResourceKind::Playlist)
             .await
             .expect("resolve playlist");
         assert!(!playlist.name.is_empty());
-        println!("PLAYLIST -> {} · {} · {:?} tracks · {:?}", playlist.name, playlist.subtitle, playlist.track_count, playlist.image);
+        println!(
+            "PLAYLIST -> {} · {} · {:?} tracks · {:?}",
+            playlist.name, playlist.subtitle, playlist.track_count, playlist.image
+        );
     }
 
     #[test]

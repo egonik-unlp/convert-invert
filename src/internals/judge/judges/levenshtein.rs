@@ -150,6 +150,10 @@ fn normalized_score(submission: &JudgeSubmission) -> f32 {
 
 #[async_trait]
 impl Judge for Levenshtein {
+    fn name(&self) -> &'static str {
+        "levenshtein"
+    }
+
     #[instrument(name = "Levenshtein::judge", skip(self, submission), fields(id=submission.track.track_id,username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
     async fn judge(&self, submission: JudgeSubmission) -> anyhow::Result<bool> {
         let distance_val = normalized_score(&submission);
@@ -193,6 +197,7 @@ mod tests {
             },
             score: None,
             relative_mi_score: None,
+            judgements: Vec::new(),
         }
     }
 

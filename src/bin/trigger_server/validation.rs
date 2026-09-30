@@ -26,6 +26,9 @@ pub struct StartRequest {
     pub playlist_range_start: Option<usize>,
     pub playlist_range_end: Option<usize>,
     pub random_order: Option<bool>,
+    /// Opt-in "extra retries": more download/search attempts and longer per-download timeouts for
+    /// this run. Defaults to `false`.
+    pub enhanced_retries: Option<bool>,
 }
 
 pub struct StartRequestValidated {
@@ -38,6 +41,7 @@ pub struct StartRequestValidated {
     pub chunk_size: usize,
     pub playlist_range: Option<(usize, usize)>,
     pub random_order: bool,
+    pub enhanced_retries: bool,
 }
 
 impl StartRequest {
@@ -130,6 +134,7 @@ impl StartRequest {
             chunk_size,
             playlist_range,
             random_order: self.random_order.unwrap_or(false),
+            enhanced_retries: self.enhanced_retries.unwrap_or(false),
         })
     }
 }
@@ -180,6 +185,7 @@ mod tests {
             playlist_range_start: None,
             playlist_range_end: None,
             random_order: None,
+            enhanced_retries: None,
         }
     }
 

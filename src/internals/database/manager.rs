@@ -1,7 +1,9 @@
 use anyhow::Context;
 use diesel::{
-    PgConnection, dsl::insert_into, prelude::*, sql_types::Integer, sql_types::Nullable,
-    sql_types::Text,
+    PgConnection,
+    dsl::insert_into,
+    prelude::*,
+    sql_types::{Bool, Float4, Integer, Nullable, Text},
 };
 
 use crate::internals::context::context_manager::{RejectedTrack, RetryRequest, Track};
@@ -220,6 +222,60 @@ impl<'a> DatabaseManager<'a> {
         .context("update and set score")?;
         Ok(())
     }
+    /// Records every judge's verdict on one candidate.
+    ///
+    /// A candidate is re-judged whenever a run reaches it again, so this upserts
+    /// on (submission, judge). The `WHERE` on the conflict branch is what keeps
+    /// the judgements feed honest: re-sending an identical verdict — which the
+    /// pipeline does whenever an already-judged candidate is rejected later for
+    /// an unrelated reason — touches nothing, so `created_at` keeps meaning
+    /// "when the judge last changed its mind".
+    fn upsert_judgements(
+        connection: &mut PgConnection,
+        judge_submission: &RuntimeJudgeSubmission,
+    ) -> anyhow::Result<()> {
+        if judge_submission.judgements.is_empty() {
+            return Ok(());
+        }
+        let submission_id = Self::get_judge_submission_id(connection, judge_submission)
+            .context("Fetch judge submission for judgements")?;
+        for judgement in &judge_submission.judgements {
+            let value = model::NewJudgementRow::from_runtime(submission_id, judgement);
+            diesel::sql_query(
+                "INSERT INTO judgements
+                     (submission, judge, model, label, score, accepted, latency_ms,
+                      prompt_version, raw, error)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (submission, judge) DO UPDATE SET
+                     model = EXCLUDED.model,
+                     label = EXCLUDED.label,
+                     score = EXCLUDED.score,
+                     accepted = EXCLUDED.accepted,
+                     latency_ms = EXCLUDED.latency_ms,
+                     prompt_version = EXCLUDED.prompt_version,
+                     raw = EXCLUDED.raw,
+                     error = EXCLUDED.error,
+                     created_at = now()
+                 WHERE judgements.score IS DISTINCT FROM EXCLUDED.score
+                    OR judgements.label IS DISTINCT FROM EXCLUDED.label
+                    OR judgements.error IS DISTINCT FROM EXCLUDED.error",
+            )
+            .bind::<Integer, _>(value.submission)
+            .bind::<Text, _>(&value.judge)
+            .bind::<Nullable<Text>, _>(value.model.as_deref())
+            .bind::<Nullable<Text>, _>(value.label.as_deref())
+            .bind::<Float4, _>(value.score)
+            .bind::<Bool, _>(value.accepted)
+            .bind::<Integer, _>(value.latency_ms)
+            .bind::<Nullable<Text>, _>(value.prompt_version.as_deref())
+            .bind::<Nullable<Text>, _>(value.raw.as_deref())
+            .bind::<Nullable<Text>, _>(value.error.as_deref())
+            .execute(connection)
+            .context("Upsert judgement")?;
+        }
+        Ok(())
+    }
+
     fn insert_judge_submission(
         connection: &mut PgConnection,
         judge_submission: &RuntimeJudgeSubmission,
@@ -305,6 +361,14 @@ impl<'a> DatabaseManager<'a> {
         rejected_track: &RejectedTrack,
     ) -> anyhow::Result<()> {
         let (judge_submission, _) = rejected_track.parts();
+        // A rejected candidate was still judged, and "why was this not
+        // downloaded" is exactly what the judgement log exists to answer — so
+        // its score and verdicts are persisted on this branch too, not only on
+        // the accepted one.
+        if judge_submission.score.is_some() {
+            Self::update_jugde_submission_score(connection, judge_submission)?;
+        }
+        Self::upsert_judgements(connection, judge_submission)?;
         let track_id = Self::get_judge_submission_id(connection, judge_submission)?;
         let value = model::NewRejectedTrackRow::from_runtime(track_id, rejected_track);
         if Self::existing_rejected_track_id(connection, track_id, &value)?.is_none() {
@@ -340,6 +404,7 @@ impl<'a> DatabaseManager<'a> {
                     }
                     Track::Downloadable(judge_submission) => {
                         Self::update_jugde_submission_score(connection, judge_submission)?;
+                        Self::upsert_judgements(connection, judge_submission)?;
                     }
                     Track::SelectCandidate(_) => {}
                     Track::File(downloaded_file) => {

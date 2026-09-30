@@ -24,6 +24,23 @@ diesel::table! {
 }
 
 diesel::table! {
+    judgements (id) {
+        id -> Int4,
+        submission -> Int4,
+        judge -> Varchar,
+        model -> Nullable<Varchar>,
+        label -> Nullable<Varchar>,
+        score -> Float4,
+        accepted -> Bool,
+        latency_ms -> Int4,
+        prompt_version -> Nullable<Varchar>,
+        raw -> Nullable<Text>,
+        error -> Nullable<Text>,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     judge_submissions (id) {
         id -> Int4,
         track -> Int4,
@@ -66,6 +83,7 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(judgements -> judge_submissions (submission));
 diesel::joinable!(judge_submissions -> downloadable_files (query));
 diesel::joinable!(judge_submissions -> search_items (track));
 diesel::joinable!(downloaded_file -> search_items (track));
@@ -77,6 +95,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     downloadable_files,
     downloaded_file,
     judge_submissions,
+    judgements,
     rejected_track,
     retry_request,
     search_items,

@@ -149,6 +149,9 @@ async fn main() -> anyhow::Result<()> {
                     .service(api::playlists)
                     .service(api::playlist)
                     .service(api::candidates)
+                    .service(api::judgements)
+                    .service(api::judge_switch)
+                    .service(api::judge_reset)
                     .service(api::track_report)
                     .service(api::logs)
                     .service(

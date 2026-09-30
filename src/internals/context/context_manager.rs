@@ -23,7 +23,10 @@ use anyhow::Context;
 use crate::internals::{
     database::db_pool_snapshot,
     download::download_manager::DownloadManager,
-    judge::{judge_manager::JudgeManager, judges::levenshtein::Levenshtein},
+    judge::{
+        judge_manager::{Judge, JudgeManager},
+        judges::{levenshtein::Levenshtein, smol::SmolJudge},
+    },
     query::query_manager::QueryManager,
     search::search_manager::{
         DownloadableFile, JudgeSubmission, SearchExitReason, SearchItem, SearchManager,
@@ -239,6 +242,126 @@ impl WorkerTuning {
             ),
         }
     }
+
+    /// A more persistent variant for opt-in "extra retries" runs: try more candidates per track,
+    /// search harder, and wait longer while collecting candidates, so tracks that would otherwise
+    /// be given up on get more chances. Concurrency and pacing are left untouched (raising them
+    /// increases Soulseek ban risk rather than persistence). The `download_*_timeout` fields are
+    /// stretched to match the boosted [`DownloadTimeouts`] the download manager runs with, keeping
+    /// the logged values honest.
+    pub fn boosted_for_retries(self) -> Self {
+        let stretch = |secs: u64| secs.saturating_mul(2);
+        Self {
+            max_candidates_per_track: self.max_candidates_per_track.saturating_mul(2).max(12),
+            max_download_attempts_per_track: self
+                .max_download_attempts_per_track
+                .saturating_mul(3)
+                .max(8),
+            candidate_collection_secs: self.candidate_collection_secs.saturating_add(15),
+            max_search_passes_per_track: self.max_search_passes_per_track.saturating_add(2),
+            max_requests_per_track: self.max_requests_per_track.saturating_mul(2).max(16),
+            download_hard_timeout_secs: stretch(self.download_hard_timeout_secs),
+            download_queued_timeout_secs: stretch(self.download_queued_timeout_secs),
+            download_stall_timeout_secs: stretch(self.download_stall_timeout_secs),
+            ..self
+        }
+    }
+}
+
+/// Redis keys holding a runtime override of the judge selection, set from the
+/// dashboard. Present only while overridden; absent means "use the environment".
+pub const JUDGE_BACKEND_KEY: &str = "judge:backend";
+pub const JUDGE_URL_KEY: &str = "judge:url";
+
+/// Normalises the many spellings of a backend to the canonical name, or `None`
+/// if the value names no judge we have.
+pub fn normalize_judge_backend(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "smol" | "smol-judge" | "llm" | "ollama" => Some("smol-judge"),
+        "levenshtein" | "lev" | "string" => Some("levenshtein"),
+        _ => None,
+    }
+}
+
+/// Which judge runs, and against which ollama.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgeSettings {
+    /// `levenshtein` or `smol-judge`.
+    pub backend: String,
+    pub url: String,
+    pub model: String,
+    /// `env` when this came from the deployment's configuration, `override`
+    /// when someone switched it from the dashboard.
+    pub source: &'static str,
+}
+
+/// The judge selection from the environment alone, ignoring any override.
+///
+/// Defaults to Levenshtein: the LLM judge needs a reachable ollama, and a
+/// deployment that has not set one up should keep working rather than reject
+/// every candidate.
+pub fn judge_settings_from_env() -> JudgeSettings {
+    JudgeSettings {
+        backend: normalize_judge_backend(&std::env::var("JUDGE_BACKEND").unwrap_or_default())
+            .unwrap_or("levenshtein")
+            .to_string(),
+        url: std::env::var("SMOL_JUDGE_URL")
+            .or_else(|_| std::env::var("OLLAMA_HOST"))
+            .unwrap_or_else(|_| SmolJudge::default_url()),
+        model: std::env::var("SMOL_JUDGE_MODEL").unwrap_or_else(|_| SmolJudge::default_model()),
+        source: "env",
+    }
+}
+
+/// The judge selection actually in force: the dashboard override if one is set,
+/// otherwise the environment.
+///
+/// Read once per run, when the managers are built — switching the judge applies
+/// to the next run, not to one already in flight. Redis being unreachable falls
+/// back to the environment rather than failing the run; a switch is a
+/// convenience, not something worth stopping a download over.
+pub fn resolve_judge_settings(redis_pool: &RedisPool) -> JudgeSettings {
+    let mut settings = judge_settings_from_env();
+    let Ok(mut con) = redis_pool.get_timeout(Duration::from_secs(3)) else {
+        return settings;
+    };
+    let backend = con
+        .get::<&str>(JUDGE_BACKEND_KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| normalize_judge_backend(&value));
+    let Some(backend) = backend else {
+        return settings;
+    };
+    settings.backend = backend.to_string();
+    settings.source = "override";
+    if let Ok(Some(url)) = con.get::<&str>(JUDGE_URL_KEY)
+        && !url.trim().is_empty()
+    {
+        settings.url = url;
+    }
+    settings
+}
+
+fn build_judge(threshold: f32, settings: &JudgeSettings) -> anyhow::Result<Box<dyn Judge>> {
+    if settings.backend == "smol-judge" {
+        let judge = SmolJudge::new(settings.url.clone(), settings.model.clone(), threshold)
+            .context("building the smol judge")?;
+        tracing::info!(
+            model = %settings.model,
+            url = %settings.url,
+            source = settings.source,
+            threshold,
+            "Judging candidates with the fine-tuned smol judge",
+        );
+        return Ok(Box::new(judge));
+    }
+    tracing::info!(
+        source = settings.source,
+        threshold,
+        "Judging candidates with the Levenshtein judge",
+    );
+    Ok(Box::new(Levenshtein::new(threshold)))
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
@@ -270,6 +393,9 @@ pub struct Managers {
     /// The Redis connection pool.
     pub redis_pool: RedisPool,
     pub search_empty_result_cutoff: usize,
+    /// When set, this run uses the more persistent "extra retries" tuning (see
+    /// [`WorkerTuning::boosted_for_retries`]) and the download manager's boosted timeouts.
+    retry_boost: bool,
 }
 
 impl Managers {
@@ -297,8 +423,14 @@ impl Managers {
         let search_manager = SearchManager::new(http.clone(), base_url.clone());
         let judge_threshold =
             score.unwrap_or(crate::internals::judge::judge_manager::JUDGE_THRESHOLD);
-        let lev_judge = Levenshtein::new(judge_threshold);
-        let judge_manager = JudgeManager::new(Box::new(lev_judge), judge_threshold);
+        // Resolved here rather than read from the environment inside the judge,
+        // so a dashboard switch takes effect on the next run without recreating
+        // the container.
+        let judge_settings = resolve_judge_settings(&redis_pool);
+        let judge_manager = JudgeManager::new(
+            build_judge(judge_threshold, &judge_settings)?,
+            judge_threshold,
+        );
         let query_manager = QueryManager::new_with_timeout(
             config.playlist_id,
             config.client_id,
@@ -313,7 +445,16 @@ impl Managers {
             db_pool,
             redis_pool,
             search_empty_result_cutoff,
+            retry_boost: false,
         })
+    }
+
+    /// Opt this run into the "extra retries" profile: more candidate/search/download attempts (via
+    /// [`WorkerTuning::boosted_for_retries`] in `run_chunk`) and more patient per-download timeouts.
+    /// Call before wrapping the `Managers` in an `Arc` and running any chunk.
+    pub fn enable_retry_boost(&mut self) {
+        self.retry_boost = true;
+        self.download_manager.boost_timeouts();
     }
 
     /// Runs a single chunk of tracks through the search-judge-download pipeline.
@@ -334,7 +475,14 @@ impl Managers {
         events: Option<Arc<Sender<RunEvent>>>,
     ) -> anyhow::Result<()> {
         let managers = Arc::clone(self);
-        let tuning = WorkerTuning::from_env();
+        let tuning = {
+            let base = WorkerTuning::from_env();
+            if self.retry_boost {
+                base.boosted_for_retries()
+            } else {
+                base
+            }
+        };
         let (sender, mut receiver) = mpsc::channel(tuning.queue_capacity);
 
         let sender = Arc::new(sender);
@@ -1210,6 +1358,7 @@ mod tests {
             },
             score: Some(score),
             relative_mi_score: None,
+            judgements: Vec::new(),
         }
     }
 

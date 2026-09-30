@@ -68,6 +68,10 @@ impl LocalLLM {
 
 #[async_trait]
 impl Judge for LocalLLM {
+    fn name(&self) -> &'static str {
+        "local_llm"
+    }
+
     #[instrument(name = "LocalLLM::judge", skip(self), fields(username = submission.query.username , query_song = submission.track.track, file_q = submission.query.filename))]
     async fn judge(&self, submission: JudgeSubmission) -> anyhow::Result<bool> {
         let response = self.get_score(submission).await.context("Getting score")?;

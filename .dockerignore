@@ -1,4 +1,5 @@
 target
+.cargo
 .env
 *.log
 logs-script*

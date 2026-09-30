@@ -95,7 +95,27 @@ pub struct JudgeSubmission {
     pub query: DownloadableFile,
     pub score: Option<f32>,
     pub relative_mi_score: Option<f32>,
+    /// Every judge's verdict on this candidate, attached by the judge manager
+    /// and persisted by the database manager on whichever branch the candidate
+    /// takes next. Empty before judging and on rows loaded back from the
+    /// database, which is why it is `serde(default)`.
+    #[serde(default)]
+    pub judgements: Vec<crate::internals::judge::judge_manager::Judgement>,
 }
+
+impl JudgeSubmission {
+    /// A freshly found candidate, before any judge has looked at it.
+    pub fn new(track: SearchItem, query: DownloadableFile) -> Self {
+        Self {
+            track,
+            query,
+            score: None,
+            relative_mi_score: None,
+            judgements: Vec::new(),
+        }
+    }
+}
+
 impl PartialEq for JudgeSubmission {
     fn eq(&self, other: &Self) -> bool {
         self.track.eq(&other.track) && self.query.eq(&other.query)
@@ -194,16 +214,14 @@ impl SearchManager {
             let Some(size) = downloadable_size(candidate.size) else {
                 continue;
             };
-            let submission = JudgeSubmission {
-                query: DownloadableFile {
+            let submission = JudgeSubmission::new(
+                track.clone(),
+                DownloadableFile {
                     filename: candidate.filename,
                     username: candidate.username,
                     size,
                 },
-                track: track.clone(),
-                score: None,
-                relative_mi_score: None,
-            };
+            );
             send(Track::Result(submission), &sender)
                 .await
                 .context("Sending result")?;

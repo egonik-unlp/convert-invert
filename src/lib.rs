@@ -1,8 +1,12 @@
 //! # convert-invert
 //!
 //! A Spotify-playlist-to-Soulseek bridge: matches Spotify tracks against the Soulseek
-//! network, scores candidates with a Levenshtein-based judge, and downloads the best
-//! match.
+//! network, scores candidates with a judge, and downloads the best match.
+//!
+//! Two judges are available, selected by `JUDGE_BACKEND`: a Levenshtein scorer
+//! (default) and `smol-judge`, a fine-tuned SmolLM served by ollama that answers
+//! with a label instead of a distance. Every verdict is persisted to the
+//! `judgements` table — see [`internals::judge`].
 //!
 //! This crate provides the core logic for searching, judging, and downloading tracks,
 //! orchestrated by a managed run cycle.

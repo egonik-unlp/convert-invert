@@ -64,6 +64,9 @@ pub struct WorkerStartOptions {
     pub chunk_size: usize,
     pub playlist_range: Option<(usize, usize)>,
     pub random_order: bool,
+    /// Opt-in "extra retries" profile: more download/search attempts and longer per-download
+    /// timeouts for this run (see [`crate::internals::context::context_manager::Managers::enable_retry_boost`]).
+    pub enhanced_retries: bool,
 }
 
 pub struct WorkerSupervisor {
@@ -94,6 +97,8 @@ struct WorkerRunConfig {
     is_leader: bool,
     all_items: Vec<SearchItem>,
     shutdown: watch::Receiver<bool>,
+    /// Whether this run uses the opt-in "extra retries" profile.
+    enhanced_retries: bool,
 }
 
 impl WorkerSupervisor {
@@ -186,6 +191,7 @@ impl WorkerSupervisor {
             playlist = %playlist_name,
             download_subdir = %download_subdir,
             random_order = options.random_order,
+            enhanced_retries = options.enhanced_retries,
             account_mode = %options.account_mode,
             username = %options.username_prefix,
             "Starting workers",
@@ -224,6 +230,7 @@ impl WorkerSupervisor {
                 is_leader: index == 0,
                 all_items: items.clone(),
                 shutdown: self.shutdown.clone(),
+                enhanced_retries: options.enhanced_retries,
             }));
 
             spawned.push(info.clone());
@@ -475,6 +482,7 @@ async fn run_worker(config: WorkerRunConfig) {
         is_leader,
         all_items,
         mut shutdown,
+        enhanced_retries,
     } = config;
 
     // Completed files are organised into a per-playlist subfolder of the shared download dir.
@@ -492,7 +500,12 @@ async fn run_worker(config: WorkerRunConfig) {
         db_pool.clone(),
         redis_pool.clone(),
     ) {
-        Ok(managers) => Arc::new(managers),
+        Ok(mut managers) => {
+            if enhanced_retries {
+                managers.enable_retry_boost();
+            }
+            Arc::new(managers)
+        }
         Err(err) => {
             tracing::error!(?err, run_id = %worker_config.run_id, "Worker failed to start managers");
             return;

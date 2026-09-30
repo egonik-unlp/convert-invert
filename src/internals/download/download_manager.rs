@@ -70,6 +70,18 @@ impl DownloadTimeouts {
             ),
         }
     }
+
+    /// A more patient variant for opt-in "extra retries" runs: every enabled timeout is doubled so
+    /// slow-but-alive peers get more room before their attempt is aborted. A `0` (disabled) timeout
+    /// stays disabled.
+    pub fn boosted(self) -> Self {
+        let stretch = |secs: u64| secs.saturating_mul(2);
+        Self {
+            hard_secs: stretch(self.hard_secs),
+            queued_secs: stretch(self.queued_secs),
+            stall_secs: stretch(self.stall_secs),
+        }
+    }
 }
 
 /// Talks to the aioslsk engine service over HTTP: start a transfer, poll its status, and mirror
@@ -118,6 +130,12 @@ impl DownloadManager {
             root_location,
             timeouts,
         }
+    }
+
+    /// Switch this manager onto the more patient "extra retries" timeouts (see
+    /// [`DownloadTimeouts::boosted`]).
+    pub fn boost_timeouts(&mut self) {
+        self.timeouts = self.timeouts.boosted();
     }
 
     pub async fn run(
