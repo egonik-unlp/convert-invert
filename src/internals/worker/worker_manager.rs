@@ -49,6 +49,9 @@ pub struct LastRun {
     /// old resume snapshots deserialize (and correctly resume as playlists).
     #[serde(default)]
     pub resource_kind: String,
+    /// Tracks the next-track model appended to the resource; absent for plain syncs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extend_count: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -67,6 +70,9 @@ pub struct WorkerStartOptions {
     /// Opt-in "extra retries" profile: more download/search attempts and longer per-download
     /// timeouts for this run (see [`crate::internals::context::context_manager::Managers::enable_retry_boost`]).
     pub enhanced_retries: bool,
+    /// Continue the resource with this many tracks picked by the next-track model. The model's
+    /// picks are downloaded together with the resource's own tracks into an "(extended)" folder.
+    pub extend_count: Option<usize>,
 }
 
 pub struct WorkerSupervisor {
@@ -131,10 +137,31 @@ impl WorkerSupervisor {
             base_config.client_secret.clone(),
             base_config.search_timeout_secs,
         );
-        let (playlist_name, playlist_tracks) = query_manager
-            .fetch_with_name(options.resource_kind)
-            .await
-            .with_context(|| format!("Fetch worker {}", options.resource_kind))?;
+        let (playlist_name, playlist_tracks) = match options.extend_count {
+            Some(count) => {
+                let extended = query_manager
+                    .fetch_extension(options.resource_kind, count, true)
+                    .await
+                    .with_context(|| format!("Extend worker {}", options.resource_kind))?;
+                let tracks = extended
+                    .seeds
+                    .into_iter()
+                    .chain(extended.generated)
+                    .map(Track::Query)
+                    .collect::<Vec<_>>();
+                (format!("{} (extended)", extended.name), tracks)
+            }
+            None => query_manager
+                .fetch_with_name(options.resource_kind)
+                .await
+                .with_context(|| format!("Fetch worker {}", options.resource_kind))?,
+        };
+        // An extended run is its own library entry and queue, separate from a plain sync of the
+        // same resource.
+        let run_key = match options.extend_count {
+            Some(_) => format!("{}+ext", options.playlist_id),
+            None => options.playlist_id.clone(),
+        };
         let download_subdir = sanitize_folder_name(&playlist_name)
             .unwrap_or_else(|| sanitize_folder_name(&options.playlist_id).unwrap_or_default());
         let playlist_tracks = apply_playlist_range(playlist_tracks, options.playlist_range);
@@ -149,10 +176,10 @@ impl WorkerSupervisor {
             shuffle_items(&mut items);
         }
 
-        self.persist_search_items(&items, &options.playlist_id, &playlist_name)
+        self.persist_search_items(&items, &run_key, &playlist_name)
             .context("Persist fetched playlist tracks")?;
 
-        self.replace_queue(&options.playlist_id, options.chunk_size, &items)
+        self.replace_queue(&run_key, options.chunk_size, &items)
             .context("Build worker queue")?;
 
         // Persist the run parameters so the dashboard can offer a one-click resume even after an
@@ -164,6 +191,7 @@ impl WorkerSupervisor {
                 chunk_size: options.chunk_size,
                 port_base: options.port_base,
                 resource_kind: options.resource_kind.as_str().to_string(),
+                extend_count: options.extend_count,
             };
             if let Ok(json) = serde_json::to_string(&last_run) {
                 let _ = redis_con.set::<_, _, ()>(LAST_RUN_KEY, json);
@@ -221,7 +249,7 @@ impl WorkerSupervisor {
 
             let handle = tokio::spawn(run_worker(WorkerRunConfig {
                 worker_config,
-                playlist_id: options.playlist_id.clone(),
+                playlist_id: run_key.clone(),
                 chunk_size: options.chunk_size,
                 download_path: self.download_path.clone(),
                 download_subdir: download_subdir.clone(),

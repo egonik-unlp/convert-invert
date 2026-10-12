@@ -1,0 +1,8 @@
+{
+  "n": 20902,
+  "dim": 192,
+  "scale": 2.8653432309511118e-05,
+  "latent": "PCA-192 (seq-20260715-131139)",
+  "model": "gru.onnx — seq-nexttrack GRU, eager_beta 0.1 (anti-eager)",
+  "n_library": 19402
+}

@@ -13,5 +13,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=build /usr/local/src/app/target/release/trigger_server /usr/local/bin/trigger_server
 COPY --from=build /usr/local/src/app/target/release/convert-invert /usr/local/bin/convert-invert
+COPY assets/infinite-playlist /app/assets/infinite-playlist
+ENV NEXTTRACK_MODEL_DIR=/app/assets/infinite-playlist
 EXPOSE 3124
 CMD ["trigger_server"]

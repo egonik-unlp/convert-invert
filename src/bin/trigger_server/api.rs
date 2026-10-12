@@ -2483,6 +2483,8 @@ pub struct LastRunResponse {
     pub port_base: u16,
     #[serde(rename = "resourceKind")]
     pub resource_kind: String,
+    #[serde(rename = "extendCount", skip_serializing_if = "Option::is_none")]
+    pub extend_count: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -2528,6 +2530,7 @@ fn read_last_run(state: &AppState) -> Option<LastRunResponse> {
         chunk_size: last_run.chunk_size,
         port_base: last_run.port_base,
         resource_kind,
+        extend_count: last_run.extend_count,
     })
 }
 
@@ -2603,6 +2606,85 @@ pub async fn resolve(
         subtitle: resolved.subtitle,
         image: resolved.image,
         track_count: resolved.track_count,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct ExtendQuery {
+    /// A Spotify URL, URI, or bare id to continue.
+    pub id: String,
+    /// "playlist" (default) | "album" | "track".
+    pub kind: Option<String>,
+    /// How many tracks the model should add (default 30).
+    pub count: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct ExtendTrack {
+    pub id: String,
+    pub name: String,
+    pub artist: String,
+}
+
+#[derive(Serialize)]
+pub struct ExtendResponse {
+    pub name: String,
+    #[serde(rename = "seedCount")]
+    pub seed_count: usize,
+    #[serde(rename = "seedsMatched")]
+    pub seeds_matched: usize,
+    #[serde(rename = "coreSize")]
+    pub core_size: usize,
+    pub tracks: Vec<ExtendTrack>,
+}
+
+/// Preview what the next-track model would append to a Spotify resource. Generation is
+/// deterministic, so starting a sync with the same `extend_count` downloads exactly these tracks.
+#[get("/extend")]
+pub async fn extend(
+    _state: web::Data<AppState>,
+    query: web::Query<ExtendQuery>,
+) -> ApiResult<HttpResponse> {
+    let query = query.into_inner();
+    if query.id.trim().is_empty() {
+        return Err(ApiError::BadRequest("id is required".into()));
+    }
+    let count = query.count.unwrap_or(30);
+    if count == 0 || count > convert_invert::internals::nexttrack::MAX_EXTEND_COUNT {
+        return Err(ApiError::BadRequest(format!(
+            "count must be 1..={}",
+            convert_invert::internals::nexttrack::MAX_EXTEND_COUNT
+        )));
+    }
+    let kind = ResourceKind::parse(query.kind.as_deref().unwrap_or("playlist"));
+
+    let base_config = Config::try_from_env()
+        .map_err(|err| ApiError::Internal(format!("Failed to load config: {err}")))?;
+    let query_manager = QueryManager::new_with_timeout(
+        query.id,
+        base_config.client_id,
+        base_config.client_secret,
+        base_config.search_timeout_secs,
+    );
+    let extended = query_manager
+        .fetch_extension(kind, count, false)
+        .await
+        .map_err(|err| ApiError::BadRequest(format!("Could not extend Spotify {kind}: {err:#}")))?;
+
+    Ok(HttpResponse::Ok().json(ExtendResponse {
+        name: extended.name,
+        seed_count: extended.seeds.len(),
+        seeds_matched: extended.seeds_matched,
+        core_size: extended.core_size,
+        tracks: extended
+            .generated
+            .into_iter()
+            .map(|item| ExtendTrack {
+                id: item.track_id,
+                name: item.track,
+                artist: item.artist,
+            })
+            .collect(),
     }))
 }
 

@@ -11,6 +11,8 @@ pub mod database;
 pub mod download;
 /// Scoring and candidate evaluation strategies.
 pub mod judge;
+/// Playlist extension with the Infinite Playlist next-track model.
+pub mod nexttrack;
 /// Parsing and deserialization helpers.
 pub mod parsing;
 /// Spotify playlist and track querying.

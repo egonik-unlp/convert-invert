@@ -1,7 +1,11 @@
 use crate::internals::{
-    context::context_manager::Track, parsing::deserialize, search::search_manager::SearchItem,
+    context::context_manager::Track,
+    nexttrack::{self, SeedTrack},
+    parsing::deserialize,
+    search::search_manager::SearchItem,
 };
 use anyhow::{Context, bail};
+use futures_util::{StreamExt, stream};
 use spotify_rs::model::PlayableItem;
 use spotify_rs::model::track::SimplifiedTrack;
 
@@ -57,6 +61,20 @@ pub struct ResolvedResource {
     pub track_count: Option<u32>,
 }
 
+/// A Spotify resource continued by the next-track model: its own tracks plus the model's picks.
+#[derive(Debug, Clone)]
+pub struct ExtendedResource {
+    pub name: String,
+    pub seeds: Vec<SearchItem>,
+    /// Seeds found in the model's library (only those steer the journey).
+    pub seeds_matched: usize,
+    pub core_size: usize,
+    pub generated: Vec<SearchItem>,
+}
+
+/// Concurrent Spotify lookups when filling in album names for generated tracks.
+const ALBUM_LOOKUP_CONCURRENCY: usize = 4;
+
 #[derive(Debug, Clone)]
 pub struct QueryManager {
     pub playlist_url: String,
@@ -111,6 +129,72 @@ impl QueryManager {
             ResourceKind::Album => self.fetch_album_with_name().await,
             ResourceKind::Track => self.fetch_track_with_name().await,
         }
+    }
+
+    /// Fetch whichever resource `kind` names and continue it with `count` tracks picked by the
+    /// next-track model. With `with_albums`, each generated track's album is looked up on Spotify
+    /// (the model catalog has none); previews skip that and leave the album empty.
+    pub async fn fetch_extension(
+        self,
+        kind: ResourceKind,
+        count: usize,
+        with_albums: bool,
+    ) -> anyhow::Result<ExtendedResource> {
+        let credentials = self.spotify_client_credentials().ok();
+        let (name, tracks) = self.fetch_with_name(kind).await?;
+        let seeds: Vec<SearchItem> = tracks
+            .into_iter()
+            .filter_map(|track| match track {
+                Track::Query(item) => Some(item),
+                _ => None,
+            })
+            .collect();
+        let seed_tracks: Vec<SeedTrack> = seeds
+            .iter()
+            .map(|item| SeedTrack {
+                track_id: item.track_id.clone(),
+                name: item.track.clone(),
+                artist: item.artist.clone(),
+            })
+            .collect();
+
+        let extension = tokio::task::spawn_blocking(move || {
+            nexttrack::shared_model()?.extend(&seed_tracks, count, nexttrack::DEFAULT_ARTIST_PENALTY)
+        })
+        .await
+        .context("Next-track generation task")??;
+
+        let mut generated: Vec<SearchItem> = extension
+            .tracks
+            .iter()
+            .map(|entry| {
+                SearchItem::new(
+                    entry.track_id().to_string(),
+                    entry.name.clone(),
+                    String::new(),
+                    entry.artist.clone(),
+                )
+            })
+            .collect();
+        if with_albums && let Some((client_id, client_secret)) = credentials {
+            fill_albums(&mut generated, client_id, client_secret).await;
+        }
+
+        tracing::info!(
+            source = %name,
+            seeds = seeds.len(),
+            seeds_matched = extension.seeds_matched,
+            core = extension.core_size,
+            generated = generated.len(),
+            "Extended Spotify {kind} with the next-track model"
+        );
+        Ok(ExtendedResource {
+            name,
+            seeds,
+            seeds_matched: extension.seeds_matched,
+            core_size: extension.core_size,
+            generated,
+        })
     }
 
     /// Fetch just the display metadata (name, artist/owner, cover art, track count) for whichever
@@ -292,6 +376,41 @@ impl QueryManager {
     }
 }
 
+/// Best-effort album lookup for model-generated tracks; a failed lookup leaves the album empty
+/// rather than dropping the track.
+async fn fill_albums(items: &mut [SearchItem], client_id: String, client_secret: String) {
+    let spotify = match spotify_rs::ClientCredsClient::authenticate(client_id, client_secret).await {
+        Ok(client) => client,
+        Err(err) => {
+            tracing::warn!(?err, "Spotify auth failed; generated tracks keep empty albums");
+            return;
+        }
+    };
+    let spotify = &spotify;
+    let albums: Vec<(usize, Option<String>)> = stream::iter(items.iter().enumerate())
+        .map(|(index, item)| {
+            let id = item.track_id.clone();
+            async move {
+                let album = spotify_rs::track(id.clone())
+                    .market("US")
+                    .get(spotify)
+                    .await
+                    .inspect_err(|err| tracing::warn!(?err, track_id = %id, "Album lookup failed"))
+                    .ok()
+                    .map(|track| track.album.name);
+                (index, album)
+            }
+        })
+        .buffer_unordered(ALBUM_LOOKUP_CONCURRENCY)
+        .collect()
+        .await;
+    for (index, album) in albums {
+        if let Some(album) = album {
+            items[index].album = album;
+        }
+    }
+}
+
 fn spotify_track_to_search_item(
     song: spotify_rs::model::track::Track,
 ) -> anyhow::Result<SearchItem> {
@@ -453,6 +572,39 @@ mod tests {
             "PLAYLIST -> {} · {} · {:?} tracks · {:?}",
             playlist.name, playlist.subtitle, playlist.track_count, playlist.image
         );
+    }
+
+    // Live check of model extension against a real playlist (needs CLIENT_ID/CLIENT_SECRET,
+    // network, and the model assets in assets/infinite-playlist):
+    //   set -a; . ../.env; set +a
+    //   cargo test --lib extend_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn extend_live_continues_a_playlist() {
+        use super::{QueryManager, ResourceKind};
+        let qm = QueryManager::new(
+            "7xh7qLfbRcLCIyWOg14VVg".to_string(),
+            std::env::var("CLIENT_ID").ok(),
+            std::env::var("CLIENT_SECRET").ok(),
+        );
+        let ext = qm
+            .fetch_extension(ResourceKind::Playlist, 10, true)
+            .await
+            .expect("extend playlist");
+        assert!(ext.seeds_matched > 0);
+        assert_eq!(ext.generated.len(), 10);
+        let seed_ids: Vec<_> = ext.seeds.iter().map(|s| &s.track_id).collect();
+        assert!(ext.generated.iter().all(|g| !seed_ids.contains(&&g.track_id)));
+        println!(
+            "{}: {} seeds, {} in library, core {}",
+            ext.name,
+            ext.seeds.len(),
+            ext.seeds_matched,
+            ext.core_size
+        );
+        for item in &ext.generated {
+            println!("  {} — {} [{}]", item.track, item.artist, item.album);
+        }
     }
 
     #[test]

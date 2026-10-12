@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+use convert_invert::internals::nexttrack::MAX_EXTEND_COUNT;
 use convert_invert::internals::query::query_manager::ResourceKind;
 
 use crate::errors::ApiError;
@@ -29,6 +30,9 @@ pub struct StartRequest {
     /// Opt-in "extra retries": more download/search attempts and longer per-download timeouts for
     /// this run. Defaults to `false`.
     pub enhanced_retries: Option<bool>,
+    /// Continue the resource with this many tracks picked by the next-track model and download
+    /// them alongside its own tracks. Absent or 0 means a plain sync.
+    pub extend_count: Option<usize>,
 }
 
 pub struct StartRequestValidated {
@@ -42,6 +46,7 @@ pub struct StartRequestValidated {
     pub playlist_range: Option<(usize, usize)>,
     pub random_order: bool,
     pub enhanced_retries: bool,
+    pub extend_count: Option<usize>,
 }
 
 impl StartRequest {
@@ -107,6 +112,13 @@ impl StartRequest {
             _ => None,
         };
 
+        let extend_count = self.extend_count.filter(|&count| count > 0);
+        if extend_count.is_some_and(|count| count > MAX_EXTEND_COUNT) {
+            return Err(ApiError::BadRequest(format!(
+                "extend_count must be 1..={MAX_EXTEND_COUNT}"
+            )));
+        }
+
         let username_prefix = if worker_account_mode == "same" {
             default_username_prefix.to_string()
         } else {
@@ -135,6 +147,7 @@ impl StartRequest {
             playlist_range,
             random_order: self.random_order.unwrap_or(false),
             enhanced_retries: self.enhanced_retries.unwrap_or(false),
+            extend_count,
         })
     }
 }
@@ -186,6 +199,7 @@ mod tests {
             playlist_range_end: None,
             random_order: None,
             enhanced_retries: None,
+            extend_count: None,
         }
     }
 
