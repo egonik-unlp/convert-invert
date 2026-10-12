@@ -22,11 +22,23 @@ pub async fn require_api_key(
         .app_data::<web::Data<AppState>>()
         .ok_or_else(|| ApiError::Internal("AppState not configured".into()))?;
 
+    // File downloads are plain browser navigations (`<a href>`), which can't carry a header, so
+    // those two routes alone also accept the key as `?key=`.
+    let query_key = matches!(request.path(), "/api/downloads/file" | "/api/downloads/zip")
+        .then(|| {
+            web::Query::<std::collections::HashMap<String, String>>::from_query(request.query_string())
+                .ok()
+                .and_then(|q| q.get("key").cloned())
+        })
+        .flatten();
     let provided = request
         .headers()
         .get("X-API-Key")
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
+        .map(str::to_string)
+        .or(query_key)
+        .unwrap_or_default();
+    let provided = provided.as_str();
 
     let expected = state.config.api_key.as_bytes();
     let presented = provided.as_bytes();

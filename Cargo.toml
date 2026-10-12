@@ -50,3 +50,6 @@ futures-util = "0.3.31"
 ratatui = "0.29.0"
 crossterm = "0.28.1"
 tract-onnx = "0.21.18"
+actix-files = "0.6"
+zip = { version = "9", default-features = false }
+bytes = "1.12.1"

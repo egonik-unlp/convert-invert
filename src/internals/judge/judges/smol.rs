@@ -174,6 +174,10 @@ pub struct SmolJudge {
     /// Run the deterministic rule engine before asking the model. On by
     /// default; set `SMOL_JUDGE_RULES=0` to measure the model on its own.
     rules_enabled: bool,
+    /// CPU threads Ollama may use per request (`SMOL_JUDGE_NUM_THREAD`, default 2; 0 leaves it
+    /// to Ollama). llama.cpp degrades badly when its threads wait on busy cores: on a loaded
+    /// 6-core host the default thread count took ~1.5 s/token versus ~8 ms/token with 2.
+    num_thread: usize,
 }
 
 impl SmolJudge {
@@ -182,7 +186,7 @@ impl SmolJudge {
             url,
             model,
             score_cutoff,
-            env_usize("SMOL_JUDGE_CONCURRENCY", 4).max(1),
+            env_usize("SMOL_JUDGE_CONCURRENCY", 2).max(1),
             Duration::from_secs(env_u64("SMOL_JUDGE_TIMEOUT_SECS", 30).max(1)),
             std::env::var("SMOL_JUDGE_KEEP_ALIVE").unwrap_or_else(|_| "30m".to_string()),
             std::env::var("SMOL_JUDGE_FALLBACK")
@@ -220,6 +224,7 @@ impl SmolJudge {
                     )
                 })
                 .unwrap_or(true),
+            num_thread: env_usize("SMOL_JUDGE_NUM_THREAD", 2),
         })
     }
 
@@ -254,7 +259,7 @@ impl SmolJudge {
             .acquire()
             .await
             .context("acquiring smol judge permit")?;
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model,
             "system": SYSTEM_PROMPT,
             "prompt": build_user_prompt(
@@ -271,6 +276,9 @@ impl SmolJudge {
             "options": { "temperature": 0, "top_p": 1, "seed": 42, "num_predict": 32 },
             "format": output_schema(),
         });
+        if self.num_thread > 0 {
+            body["options"]["num_thread"] = serde_json::json!(self.num_thread);
+        }
 
         let response = self
             .http

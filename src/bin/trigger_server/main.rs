@@ -15,6 +15,7 @@ use tokio::sync::watch;
 mod api;
 mod config;
 mod errors;
+mod files;
 mod middleware;
 mod state;
 mod validation;
@@ -147,6 +148,8 @@ async fn main() -> anyhow::Result<()> {
                     .service(api::pipeline_resume)
                     .service(api::resolve)
                     .service(api::extend)
+                    .service(files::download_file)
+                    .service(files::download_folder_zip)
                     .service(api::playlists)
                     .service(api::playlist)
                     .service(api::candidates)
