@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{self, JudgementResponse};
 use crate::auth::Principal;
 use crate::errors::{ApiError, ApiResult};
+use crate::downloaded;
 use crate::mirror;
 use crate::spotify_user::{self, API_BASE, Image, SpotifyError};
 use crate::state::AppState;
@@ -210,9 +211,9 @@ fn cache_set<T: Serialize>(state: &AppState, key: &str, value: &T, ttl_secs: u64
 }
 
 #[derive(Serialize, Deserialize)]
-struct CachedCollection {
-    meta: CollectionMeta,
-    tracks: Vec<CollectionTrack>,
+pub struct CachedCollection {
+    pub meta: CollectionMeta,
+    pub tracks: Vec<CollectionTrack>,
 }
 
 fn finish(kind: CollectionKind, id: &str, name: String, owner: String, image_url: Option<String>, tracks: Vec<CollectionTrack>) -> Resolved {
@@ -244,6 +245,7 @@ pub async fn resolve(
     let resolved = resolve_tracks(state, user_id, owner_name, kind, id).await?;
     let ids: Vec<&str> = resolved.tracks.iter().map(|track| track.spotify_id.as_str()).collect();
     cache_set(state, &ids_key(user_id, kind, id), &ids, IDS_TTL_SECS);
+    downloaded::remember(state, &resolved.meta, &resolved.tracks);
     Ok(resolved)
 }
 
@@ -515,7 +517,7 @@ pub fn is_uncertain(label: Option<&str>, score: Option<f32>, threshold: f32) -> 
     label.is_some_and(|label| label != "exact") || score.is_some_and(|score| score < threshold)
 }
 
-fn format_of(filename: &str) -> Option<String> {
+pub fn format_of(filename: &str) -> Option<String> {
     let base = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
     base.rsplit_once('.').map(|(_, ext)| ext.to_lowercase()).filter(|ext| !ext.is_empty() && ext.len() <= 5)
 }

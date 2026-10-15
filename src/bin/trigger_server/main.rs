@@ -18,6 +18,7 @@ mod collections;
 mod config;
 mod errors;
 mod files;
+mod downloaded;
 mod middleware;
 mod mirror;
 mod requests;
@@ -170,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
                     .service(collections::search)
                     .service(collections::collections_status)
                     .service(collections::fill_folder)
+                    .service(downloaded::downloaded_songs)
+                    .service(downloaded::downloaded_collections)
+                    .service(downloaded::fill_downloaded_folder)
                     .service(requests::create_request)
                     .service(requests::queue)
                     .service(requests::accept_candidate)
@@ -186,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
                     .service(api::resolve)
                     .service(api::extend)
                     .service(files::download_file)
+                    .service(files::track_file)
                     .service(files::download_folder_zip)
                     .service(api::playlists)
                     .service(api::playlist)

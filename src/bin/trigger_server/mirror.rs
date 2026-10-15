@@ -41,25 +41,11 @@ pub fn mirror_into(state: &AppState, folder: &str, spotify_ids: &[String]) -> Ap
     let root = state.config.download_path.clone();
     let target_dir = root.join(folder);
     let mut connection = state.db_pool.get()?;
-    let rows = diesel::sql_query(
-        r#"
-        SELECT DISTINCT ON (si.track_id) df.id, df.filename, df.local_path
-        FROM search_items si
-        JOIN downloaded_file df ON df.track = si.id OR df.filename IN (
-            SELECT dlf.filename FROM downloadable_files dlf
-            JOIN judge_submissions js ON js.query = dlf.id
-            WHERE js.track = si.id
-        )
-        WHERE si.track_id = ANY($1)
-        ORDER BY si.track_id, (df.local_path IS NULL), df.id DESC
-        "#,
-    )
-    .bind::<Array<Text>, _>(spotify_ids)
-    .load::<OwnedFileRow>(&mut connection)?;
+    let rows = owned_files(&mut connection, spotify_ids)?;
 
     let mut linked = 0;
     for row in rows {
-        let Some(source) = locate(&root, &row, &mut connection) else {
+        let Some(source) = locate(&root, row.id, &row.filename, row.local_path.as_deref(), &mut connection) else {
             continue;
         };
         match link_into(&root, &target_dir, &source) {
@@ -74,20 +60,54 @@ pub fn mirror_into(state: &AppState, folder: &str, spotify_ids: &[String]) -> Ap
     Ok(linked)
 }
 
+/// The file on disk for one downloaded song, if it has one we can find.
+pub fn file_for_track(state: &AppState, spotify_id: &str) -> ApiResult<Option<PathBuf>> {
+    let mut connection = state.db_pool.get()?;
+    let rows = owned_files(&mut connection, &[spotify_id.to_string()])?;
+    Ok(rows
+        .first()
+        .and_then(|row| locate(&state.config.download_path, row.id, &row.filename, row.local_path.as_deref(), &mut connection)))
+}
+
+/// The downloaded_file row of each owned song, preferring rows whose location is recorded.
+fn owned_files(connection: &mut PgConnection, spotify_ids: &[String]) -> QueryResult<Vec<OwnedFileRow>> {
+    diesel::sql_query(
+        r#"
+        SELECT DISTINCT ON (si.track_id) df.id, df.filename, df.local_path
+        FROM search_items si
+        JOIN downloaded_file df ON df.track = si.id OR df.filename IN (
+            SELECT dlf.filename FROM downloadable_files dlf
+            JOIN judge_submissions js ON js.query = dlf.id
+            WHERE js.track = si.id
+        )
+        WHERE si.track_id = ANY($1)
+        ORDER BY si.track_id, (df.local_path IS NULL), df.id DESC
+        "#,
+    )
+    .bind::<Array<Text>, _>(spotify_ids)
+    .load::<OwnedFileRow>(connection)
+}
+
 /// The file on disk for a downloaded row: its recorded path, or for rows from before paths were
 /// recorded, the one file in the tree with the remote file's name (written back once found).
-fn locate(root: &Path, row: &OwnedFileRow, connection: &mut PgConnection) -> Option<PathBuf> {
-    if let Some(path) = row.local_path.as_deref().map(PathBuf::from)
+pub fn locate(
+    root: &Path,
+    downloaded_file_id: i32,
+    remote_filename: &str,
+    local_path: Option<&str>,
+    connection: &mut PgConnection,
+) -> Option<PathBuf> {
+    if let Some(path) = local_path.map(PathBuf::from)
         && path.is_file()
         && path.starts_with(root)
     {
         return Some(path);
     }
-    let name = remote_basename(&row.filename)?;
+    let name = remote_basename(remote_filename)?;
     let found = unique_by_name(root, name)?;
     let _ = diesel::sql_query("UPDATE downloaded_file SET local_path = $1 WHERE id = $2")
         .bind::<Text, _>(found.to_string_lossy())
-        .bind::<Integer, _>(row.id)
+        .bind::<Integer, _>(downloaded_file_id)
         .execute(connection);
     Some(found)
 }

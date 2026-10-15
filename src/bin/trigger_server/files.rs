@@ -14,6 +14,7 @@ use tokio_stream_shim::ReceiverStream;
 use zip::write::SimpleFileOptions;
 
 use crate::errors::{ApiError, ApiResult};
+use crate::mirror;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -63,6 +64,33 @@ pub async fn download_file(
         .await
         .map_err(|_| ApiError::NotFound("file not found"))?
         .set_content_disposition(attachment(name.to_string()));
+    Ok(file.into_response(&request))
+}
+
+/// The file of one downloaded song, by Spotify id, wherever it was filed.
+#[get("/tracks/by-spotify/{spotify_id}/file")]
+pub async fn track_file(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    request: HttpRequest,
+) -> ApiResult<HttpResponse> {
+    let spotify_id = path.into_inner();
+    if !crate::collections::valid_spotify_id(&spotify_id) {
+        return Err(ApiError::BadRequest("not a Spotify track id".into()));
+    }
+    let state_for_lookup = state.clone();
+    let found = web::block(move || mirror::file_for_track(&state_for_lookup, &spotify_id))
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))??
+        .ok_or(ApiError::NotFound("this song has no downloaded file"))?;
+    let name = found
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "song".to_string());
+    let file = NamedFile::open_async(&found)
+        .await
+        .map_err(|_| ApiError::NotFound("file not found"))?
+        .set_content_disposition(attachment(name));
     Ok(file.into_response(&request))
 }
 
