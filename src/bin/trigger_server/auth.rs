@@ -336,7 +336,10 @@ async fn complete_login(
     let profile = spotify_user::fetch_me(&tokens.access_token)
         .await
         .map_err(|err| LoginError::Spotify(format!("{err:?}")))?;
-    let email = profile.email.as_deref().map(str::to_lowercase).ok_or(LoginError::NotInvited)?;
+    let Some(email) = profile.email.as_deref().map(str::to_lowercase) else {
+        tracing::warn!(spotify_id = %profile.id, "login rejected: Spotify returned no email");
+        return Err(LoginError::NotInvited);
+    };
     let avatar = profile.images.first().map(|image| image.url.clone());
 
     let db = |err: diesel::result::Error| LoginError::Spotify(err.to_string());
@@ -352,7 +355,11 @@ async fn complete_login(
     .map(|row| ExistingUser { id: row.id, status: row.status });
 
     let user_id = match decide_login(existing.as_ref(), state.config.is_admin_email(&email)) {
-        LoginDecision::Reject => return Err(LoginError::NotInvited),
+        LoginDecision::Reject => {
+            // Logged so an admin can see who tried, and with which email, before inviting them.
+            tracing::info!(%email, spotify_id = %profile.id, "login rejected: not invited");
+            return Err(LoginError::NotInvited);
+        }
         LoginDecision::CreateAdmin => diesel::sql_query(
             r#"
             INSERT INTO users (spotify_id, email, display_name, avatar_url, role, status, last_seen_at)
