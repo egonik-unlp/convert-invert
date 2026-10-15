@@ -67,11 +67,19 @@ pub async fn download_file(
     Ok(file.into_response(&request))
 }
 
-/// The file of one downloaded song, by Spotify id, wherever it was filed.
+#[derive(Deserialize)]
+pub struct TrackFileQuery {
+    /// `1` to play it in the page (the player) instead of saving it.
+    inline: Option<u8>,
+}
+
+/// The file of one downloaded song, by Spotify id, wherever it was filed. Range requests work, so
+/// the player can seek.
 #[get("/tracks/by-spotify/{spotify_id}/file")]
 pub async fn track_file(
     state: web::Data<AppState>,
     path: web::Path<String>,
+    query: web::Query<TrackFileQuery>,
     request: HttpRequest,
 ) -> ApiResult<HttpResponse> {
     let spotify_id = path.into_inner();
@@ -87,10 +95,15 @@ pub async fn track_file(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "song".to_string());
+    let disposition = if query.inline == Some(1) {
+        ContentDisposition { disposition: DispositionType::Inline, parameters: vec![DispositionParam::Filename(name)] }
+    } else {
+        attachment(name)
+    };
     let file = NamedFile::open_async(&found)
         .await
         .map_err(|_| ApiError::NotFound("file not found"))?
-        .set_content_disposition(attachment(name));
+        .set_content_disposition(disposition);
     Ok(file.into_response(&request))
 }
 
