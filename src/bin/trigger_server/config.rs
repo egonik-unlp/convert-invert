@@ -34,6 +34,15 @@ pub struct AppConfig {
     pub cookie_secure: bool,
 }
 
+/// `https://host/convert/api/auth/callback` -> `/convert/`; anything unexpected -> `/`.
+pub fn app_base_from_redirect(redirect_uri: &str) -> String {
+    reqwest::Url::parse(redirect_uri)
+        .ok()
+        .and_then(|url| url.path().strip_suffix("api/auth/callback").map(str::to_string))
+        .filter(|base| base.starts_with('/') && base.ends_with('/'))
+        .unwrap_or_else(|| "/".to_string())
+}
+
 impl AppConfig {
     /// Client id, secret and redirect URI, or a message saying which env var is missing.
     pub fn spotify_oauth(&self) -> Result<(&str, &str, &str), String> {
@@ -47,6 +56,13 @@ impl AppConfig {
             .as_deref()
             .ok_or("SPOTIFY_REDIRECT_URI is not set")?;
         Ok((id, secret, redirect))
+    }
+
+    /// Where the app lives on its public origin, e.g. `/` or `/convert/` when a reverse proxy
+    /// mounts it under a prefix. Read off SPOTIFY_REDIRECT_URI, which already has to be the
+    /// exact public callback URL, so a prefix needs no setting of its own.
+    pub fn app_base(&self) -> String {
+        app_base_from_redirect(self.spotify_redirect_uri.as_deref().unwrap_or_default())
     }
 
     pub fn is_admin_email(&self, email: &str) -> bool {
@@ -265,7 +281,7 @@ pub fn parse_admin_emails(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, app_base_from_redirect};
     use std::path::PathBuf;
 
     fn config(worker: &str, share: &str, share_mode: &str) -> AppConfig {
@@ -359,5 +375,13 @@ mod tests {
         assert!(config.worker_port_capacity_warning_for(1, 40999).is_some());
         assert!(config.worker_port_capacity_warning_for(33, 41000).is_some());
         assert!(config.worker_port_capacity_warning_for(32, 41000).is_none());
+    }
+
+    #[test]
+    fn app_base_follows_the_redirect_uri() {
+        assert_eq!(app_base_from_redirect("http://127.0.0.1:5173/api/auth/callback"), "/");
+        assert_eq!(app_base_from_redirect("https://box.example.ts.net/convert/api/auth/callback"), "/convert/");
+        assert_eq!(app_base_from_redirect("https://box.example/oauth/done"), "/");
+        assert_eq!(app_base_from_redirect(""), "/");
     }
 }

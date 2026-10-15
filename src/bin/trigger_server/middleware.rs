@@ -1,3 +1,6 @@
+use std::net::IpAddr;
+
+use actix_governor::{KeyExtractor, SimpleKeyExtractionError};
 use actix_web::body::MessageBody;
 use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::http::Method;
@@ -127,6 +130,45 @@ pub fn is_same_origin_write(
     }
 }
 
+/// Rate-limit key: the client's IP. Behind the frontend's nginx every request arrives from the
+/// nginx container, which would make the whole group share one bucket, so a proxy's
+/// `X-Real-IP` is used when the peer is a private or loopback address. A LAN client could
+/// forge the header, but that only moves it to another bucket; auth still applies.
+#[derive(Clone)]
+pub struct ClientIpKeyExtractor;
+
+impl KeyExtractor for ClientIpKeyExtractor {
+    type Key = IpAddr;
+    type KeyExtractionError = SimpleKeyExtractionError<&'static str>;
+
+    fn extract(&self, req: &ServiceRequest) -> Result<Self::Key, Self::KeyExtractionError> {
+        let real_ip = req.headers().get("X-Real-IP").and_then(|value| value.to_str().ok());
+        client_ip(req.peer_addr().map(|socket| socket.ip()), real_ip)
+            .ok_or_else(|| SimpleKeyExtractionError::new("Could not extract client IP address from request"))
+    }
+}
+
+pub fn client_ip(peer: Option<IpAddr>, real_ip: Option<&str>) -> Option<IpAddr> {
+    let peer = peer?;
+    let trusted = match peer {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    };
+    let ip = trusted
+        .then(|| real_ip.and_then(|value| value.trim().parse::<IpAddr>().ok()))
+        .flatten()
+        .unwrap_or(peer);
+    // Same as PeerIpKeyExtractor: IPv6 clients usually hold a whole /56, so limit per prefix.
+    Some(match ip {
+        IpAddr::V6(ipv6) => {
+            let mut octets = ipv6.octets();
+            octets[7..16].fill(0);
+            IpAddr::V6(octets.into())
+        }
+        v4 => v4,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +205,16 @@ mod tests {
         assert!(!constant_time_eq(b"0123456789abcdef", b"0123456789abcdeX"));
         assert!(!constant_time_eq(b"0123456789abcdef", b"0123"));
         assert!(!constant_time_eq(b"0123456789abcdef", b""));
+    }
+
+    #[test]
+    fn client_ip_trusts_real_ip_only_from_a_private_peer() {
+        let nginx: IpAddr = "172.18.0.5".parse().unwrap();
+        let public: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(client_ip(Some(nginx), Some("192.168.1.20")), Some("192.168.1.20".parse().unwrap()));
+        assert_eq!(client_ip(Some(nginx), None), Some(nginx));
+        assert_eq!(client_ip(Some(nginx), Some("garbage")), Some(nginx));
+        assert_eq!(client_ip(Some(public), Some("192.168.1.20")), Some(public));
+        assert_eq!(client_ip(None, Some("192.168.1.20")), None);
     }
 }

@@ -238,11 +238,12 @@ pub async fn login(state: web::Data<AppState>, query: web::Query<LoginQuery>) ->
         .query(&mut con)?;
 
     let url = spotify_user::authorize_url(client_id, redirect_uri, &oauth_state, &pkce_challenge(&verifier));
+    let oauth_path = format!("{}api/auth", state.config.app_base());
     Ok(redirect(&url)
         .cookie(cookie(
             OAUTH_COOKIE,
             oauth_state,
-            "/api/auth",
+            &oauth_path,
             CookieDuration::seconds(OAUTH_TTL_SECS as i64),
             state.config.cookie_secure,
         ))
@@ -402,10 +403,12 @@ pub async fn callback(
     query: web::Query<CallbackQuery>,
 ) -> HttpResponse {
     let secure = state.config.cookie_secure;
-    let clear_oauth = cookie(OAUTH_COOKIE, String::new(), "/api/auth", CookieDuration::ZERO, secure);
+    let base = state.config.app_base();
+    let oauth_path = format!("{base}api/auth");
+    let clear_oauth = cookie(OAUTH_COOKIE, String::new(), &oauth_path, CookieDuration::ZERO, secure);
     match complete_login(&state, &request, &query).await {
-        Ok((session, return_to)) => redirect(&format!("/{return_to}"))
-            .cookie(cookie(SESSION_COOKIE, session, "/", CookieDuration::days(SESSION_DAYS), secure))
+        Ok((session, return_to)) => redirect(&format!("{base}{return_to}"))
+            .cookie(cookie(SESSION_COOKIE, session, &base, CookieDuration::days(SESSION_DAYS), secure))
             .cookie(clear_oauth)
             .finish(),
         Err(error) => {
@@ -417,7 +420,7 @@ pub async fn callback(
                     "spotify"
                 }
             };
-            redirect(&format!("/?login_error={code}")).cookie(clear_oauth).finish()
+            redirect(&format!("{base}?login_error={code}")).cookie(clear_oauth).finish()
         }
     }
 }
@@ -429,8 +432,9 @@ pub async fn logout(state: web::Data<AppState>, request: HttpRequest) -> ApiResu
             .bind::<Text, _>(hash_token(session.value()))
             .execute(&mut state.db_pool.get()?)?;
     }
+    let base = state.config.app_base();
     Ok(HttpResponse::NoContent()
-        .cookie(cookie(SESSION_COOKIE, String::new(), "/", CookieDuration::ZERO, state.config.cookie_secure))
+        .cookie(cookie(SESSION_COOKIE, String::new(), &base, CookieDuration::ZERO, state.config.cookie_secure))
         .finish())
 }
 

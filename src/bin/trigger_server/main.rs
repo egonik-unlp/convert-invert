@@ -25,7 +25,7 @@ mod state;
 mod validation;
 mod workers;
 
-use crate::middleware::require_auth;
+use crate::middleware::{ClientIpKeyExtractor, require_auth};
 use crate::state::AppState;
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
@@ -112,12 +112,14 @@ async fn main() -> anyhow::Result<()> {
     // authenticated API limit needs to allow normal UI use without throttling.
     // Keep write-heavy worker starts on the stricter nested governor below.
     let global_governor = GovernorConfigBuilder::default()
+        .key_extractor(ClientIpKeyExtractor)
         .milliseconds_per_request(250)
         .burst_size(60)
         .finish()
         .ok_or_else(|| anyhow::anyhow!("Invalid global governor config"))?;
     // 5 req/min per IP on /workers/start: one token every 12s with a burst of 3.
     let workers_governor = GovernorConfigBuilder::default()
+        .key_extractor(ClientIpKeyExtractor)
         .seconds_per_request(12)
         .burst_size(3)
         .finish()
