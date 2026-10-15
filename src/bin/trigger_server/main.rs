@@ -13,23 +13,28 @@ use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use tokio::sync::watch;
 
 mod api;
+mod auth;
+mod collections;
 mod config;
 mod errors;
 mod files;
 mod middleware;
+mod requests;
+mod spotify_user;
 mod state;
 mod validation;
 mod workers;
 
-use crate::middleware::require_api_key;
+use crate::middleware::require_auth;
 use crate::state::AppState;
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
 fn build_cors(allowed_origins: &[String]) -> Cors {
     let mut cors = Cors::default()
-        .allowed_methods(vec!["GET", "POST"])
-        .allowed_headers(vec!["X-API-Key", "Content-Type"])
+        .allowed_methods(vec!["GET", "POST", "PATCH"])
+        .allowed_headers(vec!["Content-Type"])
+        .supports_credentials()
         .max_age(3600);
     for origin in allowed_origins {
         cors = cors.allowed_origin(origin);
@@ -118,6 +123,18 @@ async fn main() -> anyhow::Result<()> {
         .finish()
         .ok_or_else(|| anyhow::anyhow!("Invalid workers governor config"))?;
 
+    if !app_config.cookie_secure
+        && app_config
+            .allowed_origins
+            .iter()
+            .any(|origin| !origin.contains("localhost") && !origin.contains("127.0.0.1"))
+    {
+        tracing::warn!("COOKIE_SECURE is off but ALLOWED_ORIGINS has non-local origins; session cookies will travel over plain HTTP");
+    }
+    if app_config.spotify_oauth().is_err() {
+        tracing::warn!("Spotify login is not configured (CLIENT_ID / CLIENT_SECRET / SPOTIFY_REDIRECT_URI); only the API key works");
+    }
+
     let allowed_origins = app_config.allowed_origins.clone();
     let bind = app_config.bind.clone();
     let app_state = state.clone();
@@ -128,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
             .wrap(build_cors(&allowed_origins))
             .service(
                 web::scope("/api")
-                    .wrap(from_fn(require_api_key))
+                    .wrap(from_fn(require_auth))
                     .wrap(
                         DefaultHeaders::new()
                             .add(("Cache-Control", "no-store"))
@@ -136,6 +153,22 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .wrap(Governor::new(&global_governor))
                     .service(api::health)
+                    .service(auth::login)
+                    .service(auth::callback)
+                    .service(auth::logout)
+                    .service(auth::me)
+                    .service(auth::update_me)
+                    .service(auth::list_users)
+                    .service(auth::invite_user)
+                    .service(auth::update_user)
+                    .service(spotify_user::library)
+                    .service(collections::collection)
+                    .service(collections::judging)
+                    .service(collections::search)
+                    .service(collections::collections_status)
+                    .service(requests::create_request)
+                    .service(requests::queue)
+                    .service(requests::accept_candidate)
                     .service(api::stats)
                     .service(api::network)
                     .service(api::config)

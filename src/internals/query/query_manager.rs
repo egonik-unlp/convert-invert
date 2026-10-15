@@ -378,7 +378,7 @@ impl QueryManager {
 
 /// Best-effort album lookup for model-generated tracks; a failed lookup leaves the album empty
 /// rather than dropping the track.
-async fn fill_albums(items: &mut [SearchItem], client_id: String, client_secret: String) {
+pub async fn fill_albums(items: &mut [SearchItem], client_id: String, client_secret: String) {
     let spotify = match spotify_rs::ClientCredsClient::authenticate(client_id, client_secret).await {
         Ok(client) => client,
         Err(err) => {

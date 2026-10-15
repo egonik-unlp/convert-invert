@@ -21,9 +21,38 @@ pub struct AppConfig {
     pub share_username: String,
     pub search_timeout_secs: u8,
     pub search_empty_result_cutoff: usize,
+    /// Spotify app credentials (same `CLIENT_ID` / `CLIENT_SECRET` the workers use).
+    pub spotify_client_id: Option<String>,
+    pub spotify_client_secret: Option<String>,
+    /// Where Spotify sends people back after login; must be registered in the Spotify dashboard.
+    pub spotify_redirect_uri: Option<String>,
+    /// AES-256-GCM key for the Spotify tokens stored per user.
+    pub token_key: [u8; 32],
+    /// Lower-cased emails that become admins on login, invited or not.
+    pub admin_emails: Vec<String>,
+    /// `Secure` flag on session cookies. Only turn off for plain-HTTP local development.
+    pub cookie_secure: bool,
 }
 
 impl AppConfig {
+    /// Client id, secret and redirect URI, or a message saying which env var is missing.
+    pub fn spotify_oauth(&self) -> Result<(&str, &str, &str), String> {
+        let id = self.spotify_client_id.as_deref().ok_or("CLIENT_ID is not set")?;
+        let secret = self
+            .spotify_client_secret
+            .as_deref()
+            .ok_or("CLIENT_SECRET is not set")?;
+        let redirect = self
+            .spotify_redirect_uri
+            .as_deref()
+            .ok_or("SPOTIFY_REDIRECT_URI is not set")?;
+        Ok((id, secret, redirect))
+    }
+
+    pub fn is_admin_email(&self, email: &str) -> bool {
+        self.admin_emails.iter().any(|admin| admin == email)
+    }
+
     pub fn account_conflict(&self) -> bool {
         self.account_conflict_for(self.worker_count, &self.username_prefix)
     }
@@ -118,6 +147,17 @@ pub fn load() -> anyhow::Result<AppConfig> {
         .filter(|origin| !origin.is_empty())
         .collect();
 
+    let token_key = parse_token_key(&std::env::var("TOKEN_ENC_KEY").map_err(|_| {
+        anyhow::anyhow!(
+            "TOKEN_ENC_KEY env var is required — generate one with `openssl rand -base64 32`"
+        )
+    })?)?;
+    let admin_emails = parse_admin_emails(&std::env::var("ADMIN_EMAILS").unwrap_or_default());
+    let cookie_secure = !matches!(
+        std::env::var("COOKIE_SECURE").as_deref(),
+        Ok("false" | "0" | "off")
+    );
+
     let bind = std::env::var("SERVER_BIND").unwrap_or_else(|_| "127.0.0.1:3124".to_string());
     let worker_count = std::env::var("WORKER_COUNT")
         .ok()
@@ -188,7 +228,39 @@ pub fn load() -> anyhow::Result<AppConfig> {
         share_username,
         search_timeout_secs,
         search_empty_result_cutoff,
+        spotify_client_id: non_empty_env("CLIENT_ID"),
+        spotify_client_secret: non_empty_env("CLIENT_SECRET"),
+        spotify_redirect_uri: non_empty_env("SPOTIFY_REDIRECT_URI"),
+        token_key,
+        admin_emails,
+        cookie_secure,
     })
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Decode `TOKEN_ENC_KEY` (base64, 32 bytes).
+pub fn parse_token_key(value: &str) -> anyhow::Result<[u8; 32]> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value.trim())
+        .map_err(|err| anyhow::anyhow!("TOKEN_ENC_KEY is not valid base64: {err}"))?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| anyhow::anyhow!("TOKEN_ENC_KEY must decode to 32 bytes, got {}", bytes.len()))
+}
+
+pub fn parse_admin_emails(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|email| email.trim().to_lowercase())
+        .filter(|email| !email.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -217,7 +289,28 @@ mod tests {
             share_username: share.to_string(),
             search_timeout_secs: 20,
             search_empty_result_cutoff: 8,
+            spotify_client_id: None,
+            spotify_client_secret: None,
+            spotify_redirect_uri: None,
+            token_key: [7; 32],
+            admin_emails: Vec::new(),
+            cookie_secure: true,
         }
+    }
+
+    #[test]
+    fn parses_token_key() {
+        assert!(super::parse_token_key("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=").is_ok());
+        assert!(super::parse_token_key("c2hvcnQ=").is_err());
+        assert!(super::parse_token_key("not base64!").is_err());
+    }
+
+    #[test]
+    fn parses_admin_emails() {
+        assert_eq!(
+            super::parse_admin_emails(" Gonik@Example.com, ,lu@example.com"),
+            vec!["gonik@example.com".to_string(), "lu@example.com".to_string()]
+        );
     }
 
     #[test]

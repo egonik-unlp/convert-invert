@@ -15,7 +15,7 @@ use crate::internals::context::context_manager::{Managers, RedisPool, Track, Wor
 use crate::internals::database::DbPool;
 use crate::internals::database::manager::DatabaseManager;
 use crate::internals::query::query_manager::{QueryManager, ResourceKind};
-use crate::internals::search::search_manager::SearchItem;
+use crate::internals::search::search_manager::{JudgeSubmission, SearchItem};
 use crate::internals::utils::config::config_manager::Config;
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -73,6 +73,31 @@ pub struct WorkerStartOptions {
     /// Continue the resource with this many tracks picked by the next-track model. The model's
     /// picks are downloaded together with the resource's own tracks into an "(extended)" folder.
     pub extend_count: Option<usize>,
+    /// Tracks the caller already resolved (with a user's Spotify token, already filtered and
+    /// extended). When set, the supervisor skips its own client-credentials fetch.
+    pub pre_resolved: Option<PreResolved>,
+    /// Download request this run serves. Gives the run its own queue and tags its tracks.
+    pub request_id: Option<i32>,
+}
+
+/// A ready-made track list for [`WorkerStartOptions::pre_resolved`].
+#[derive(Clone, Debug)]
+pub struct PreResolved {
+    /// Display name; also the download folder.
+    pub name: String,
+    pub items: Vec<SearchItem>,
+}
+
+/// Prefix of the run id of every worker serving download request `request_id`, so the API can
+/// tell which requests still have live workers.
+pub fn request_run_id_prefix(request_id: i32) -> String {
+    format!("req{request_id}")
+}
+
+/// Inverse of [`request_run_id_prefix`] applied to a worker's run id (`req12-1` -> 12).
+pub fn request_id_from_run_id(run_id: &str) -> Option<i32> {
+    let rest = run_id.strip_prefix("req")?;
+    rest.split('-').next()?.parse().ok()
 }
 
 pub struct WorkerSupervisor {
@@ -105,6 +130,8 @@ struct WorkerRunConfig {
     shutdown: watch::Receiver<bool>,
     /// Whether this run uses the opt-in "extra retries" profile.
     enhanced_retries: bool,
+    /// Tracks to run before draining the queue (a forced download of one known candidate).
+    forced: Vec<Track>,
 }
 
 impl WorkerSupervisor {
@@ -137,8 +164,12 @@ impl WorkerSupervisor {
             base_config.client_secret.clone(),
             base_config.search_timeout_secs,
         );
-        let (playlist_name, playlist_tracks) = match options.extend_count {
-            Some(count) => {
+        let (playlist_name, playlist_tracks) = match (&options.pre_resolved, options.extend_count) {
+            (Some(pre), _) => (
+                pre.name.clone(),
+                pre.items.iter().cloned().map(Track::Query).collect::<Vec<_>>(),
+            ),
+            (None, Some(count)) => {
                 let extended = query_manager
                     .fetch_extension(options.resource_kind, count, true)
                     .await
@@ -151,16 +182,24 @@ impl WorkerSupervisor {
                     .collect::<Vec<_>>();
                 (format!("{} (extended)", extended.name), tracks)
             }
-            None => query_manager
+            (None, None) => query_manager
                 .fetch_with_name(options.resource_kind)
                 .await
                 .with_context(|| format!("Fetch worker {}", options.resource_kind))?,
         };
         // An extended run is its own library entry and queue, separate from a plain sync of the
         // same resource.
-        let run_key = match options.extend_count {
-            Some(_) => format!("{}+ext", options.playlist_id),
-            None => options.playlist_id.clone(),
+        // A request gets its own queue so concurrent requests never clobber each other.
+        let run_key = match (options.request_id, options.extend_count) {
+            (Some(request_id), _) => request_run_id_prefix(request_id),
+            (None, Some(_)) => format!("{}+ext", options.playlist_id),
+            (None, None) => options.playlist_id.clone(),
+        };
+        // The library tag stays the Spotify id (requests included), so the per-playlist views
+        // keep grouping by resource rather than by request.
+        let library_tag = match options.request_id {
+            Some(_) => options.playlist_id.clone(),
+            None => run_key.clone(),
         };
         let download_subdir = sanitize_folder_name(&playlist_name)
             .unwrap_or_else(|| sanitize_folder_name(&options.playlist_id).unwrap_or_default());
@@ -176,7 +215,7 @@ impl WorkerSupervisor {
             shuffle_items(&mut items);
         }
 
-        self.persist_search_items(&items, &run_key, &playlist_name)
+        self.persist_search_items(&items, &library_tag, &playlist_name, options.request_id)
             .context("Persist fetched playlist tracks")?;
 
         self.replace_queue(&run_key, options.chunk_size, &items)
@@ -184,7 +223,10 @@ impl WorkerSupervisor {
 
         // Persist the run parameters so the dashboard can offer a one-click resume even after an
         // api restart clears the in-memory worker state. Best-effort: never fail a start over it.
-        if let Ok(mut redis_con) = self.redis_pool.get() {
+        // Requests are skipped: their tracks may need the requester's token to resolve again.
+        if options.pre_resolved.is_none()
+            && let Ok(mut redis_con) = self.redis_pool.get()
+        {
             let last_run = LastRun {
                 playlist_id: options.playlist_id.clone(),
                 worker_count: options.worker_count,
@@ -259,6 +301,7 @@ impl WorkerSupervisor {
                 all_items: items.clone(),
                 shutdown: self.shutdown.clone(),
                 enhanced_retries: options.enhanced_retries,
+                forced: Vec::new(),
             }));
 
             spawned.push(info.clone());
@@ -266,6 +309,55 @@ impl WorkerSupervisor {
         }
 
         Ok(spawned)
+    }
+
+    /// Download one specific, already-known candidate, skipping search and judging ("use this
+    /// file anyway"). Runs as a single short-lived worker with an empty queue of its own.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_forced_download(
+        &self,
+        submission: JudgeSubmission,
+        download_subdir: String,
+        base_config: Config,
+        user_password: String,
+        username_prefix: &str,
+        account_mode: &str,
+        port_base: u16,
+        run_id_prefix: &str,
+    ) -> anyhow::Result<WorkerInfo> {
+        let info = worker_info(
+            self.next_worker_id.fetch_add(1, Ordering::Relaxed),
+            username_prefix,
+            account_mode,
+            port_base,
+            run_id_prefix,
+            0,
+        );
+        let mut worker_config = base_config;
+        worker_config.user_name = info.username.clone();
+        worker_config.user_password = user_password;
+        worker_config.listen_port = u32::from(info.port);
+        worker_config.run_id = info.run_id.clone();
+
+        let handle = tokio::spawn(run_worker(WorkerRunConfig {
+            worker_config,
+            playlist_id: format!("{}-forced", info.run_id),
+            chunk_size: 1,
+            download_path: self.download_path.clone(),
+            download_subdir: sanitize_folder_name(&download_subdir).unwrap_or_default(),
+            redis_pool: self.redis_pool.clone(),
+            db_pool: self.db_pool.clone(),
+            is_leader: false,
+            all_items: Vec::new(),
+            shutdown: self.shutdown.clone(),
+            enhanced_retries: false,
+            forced: vec![Track::Downloadable(submission)],
+        }));
+        self.workers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("worker lock poisoned"))?
+            .push(WorkerHandle { info: info.clone(), handle });
+        Ok(info)
     }
 
     pub fn stop(&self, target_ids: Option<&[u32]>) -> anyhow::Result<Vec<u32>> {
@@ -362,6 +454,7 @@ impl WorkerSupervisor {
         items: &[SearchItem],
         playlist_id: &str,
         playlist_name: &str,
+        request_id: Option<i32>,
     ) -> anyhow::Result<()> {
         let mut conn = self.db_pool.get().context("Acquire DB connection")?;
         let mut database_manager = DatabaseManager::new(&mut conn);
@@ -371,6 +464,15 @@ impl WorkerSupervisor {
             database_manager
                 .upsert_search_item_with_playlist(item, pl_id.clone(), pl_name.clone())
                 .with_context(|| format!("Persist search item {}", item.track_id))?;
+        }
+        if let Some(request_id) = request_id {
+            use diesel::RunQueryDsl;
+            let track_ids = items.iter().map(|item| item.track_id.clone()).collect::<Vec<_>>();
+            diesel::sql_query("UPDATE search_items SET request_id = $1 WHERE track_id = ANY($2)")
+                .bind::<diesel::sql_types::Integer, _>(request_id)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(track_ids)
+                .execute(&mut conn)
+                .context("Tag search items with their request")?;
         }
         tracing::info!(
             track_count = items.len(),
@@ -511,6 +613,7 @@ async fn run_worker(config: WorkerRunConfig) {
         all_items,
         mut shutdown,
         enhanced_retries,
+        forced,
     } = config;
 
     // Completed files are organised into a per-playlist subfolder of the shared download dir.
@@ -539,6 +642,12 @@ async fn run_worker(config: WorkerRunConfig) {
             return;
         }
     };
+
+    if !forced.is_empty()
+        && let Err(err) = managers.run_chunk(forced).await
+    {
+        tracing::error!(?err, run_id = %worker_config.run_id, "Forced download failed");
+    }
 
     loop {
         if *shutdown.borrow() {
@@ -649,6 +758,16 @@ mod tests {
             "album".to_string(),
             "artist".to_string(),
         )
+    }
+
+    #[test]
+    fn request_run_ids_round_trip() {
+        use super::{request_id_from_run_id, request_run_id_prefix};
+        let info = worker_info(1, "worker", "same", 41000, &request_run_id_prefix(12), 1);
+        assert_eq!(info.run_id, "req12-2");
+        assert_eq!(request_id_from_run_id(&info.run_id), Some(12));
+        assert_eq!(request_id_from_run_id("web-trigger-1"), None);
+        assert_eq!(request_id_from_run_id("reqx-1"), None);
     }
 
     #[test]

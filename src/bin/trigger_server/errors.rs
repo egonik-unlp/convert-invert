@@ -7,6 +7,8 @@ use std::fmt;
 pub enum ApiError {
     BadRequest(String),
     Unauthorized,
+    Forbidden(&'static str),
+    BadGateway(String),
     NotFound(&'static str),
     Internal(String),
 }
@@ -16,6 +18,8 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::BadRequest(message) => write!(formatter, "{message}"),
             ApiError::Unauthorized => write!(formatter, "Unauthorized"),
+            ApiError::Forbidden(message) => write!(formatter, "{message}"),
+            ApiError::BadGateway(message) => write!(formatter, "{message}"),
             ApiError::NotFound(message) => write!(formatter, "{message}"),
             ApiError::Internal(message) => write!(formatter, "{message}"),
         }
@@ -27,6 +31,8 @@ impl ResponseError for ApiError {
         match self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
+            ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -38,6 +44,8 @@ impl ResponseError for ApiError {
             "code": match self {
                 ApiError::BadRequest(_) => "bad_request",
                 ApiError::Unauthorized => "unauthorized",
+                ApiError::Forbidden(_) => "forbidden",
+                ApiError::BadGateway(_) => "bad_gateway",
                 ApiError::NotFound(_) => "not_found",
                 ApiError::Internal(_) => "internal",
             },

@@ -17,6 +17,7 @@ use diesel::sql_types::{Bool, Float4, Integer, Nullable, Text};
 use redis::Commands;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::RequireAdmin;
 use crate::errors::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::validation::PlaylistQuery;
@@ -154,6 +155,9 @@ pub struct JudgementFeedItem {
     pub submission_id: i32,
     #[serde(rename = "trackDbId")]
     pub track_db_id: i32,
+    /// Spotify track id, so the feed can open the judging panel.
+    #[serde(rename = "spotifyId")]
+    pub spotify_id: String,
     pub title: String,
     pub artist: String,
     pub album: String,
@@ -547,6 +551,8 @@ struct JudgementFeedRow {
     #[diesel(sql_type = Integer)]
     track_db_id: i32,
     #[diesel(sql_type = Text)]
+    spotify_id: String,
+    #[diesel(sql_type = Text)]
     title: String,
     #[diesel(sql_type = Text)]
     artist: String,
@@ -806,7 +812,7 @@ fn playlist_summary(
     }
 }
 
-fn format_reject_reason(reason: Option<String>, value: Option<String>) -> Option<String> {
+pub(crate) fn format_reject_reason(reason: Option<String>, value: Option<String>) -> Option<String> {
     reason.map(|reason| {
         let mut formatted = reason.replace('_', " ").to_uppercase();
         if let Some(value) = value.filter(|value| !value.is_empty()) {
@@ -1198,6 +1204,7 @@ pub struct JudgeSwitchBody {
 /// run already in flight keeps the judge it began with.
 #[post("/judge")]
 pub async fn judge_switch(
+    _admin: RequireAdmin,
     state: web::Data<AppState>,
     body: web::Json<JudgeSwitchBody>,
 ) -> ApiResult<HttpResponse> {
@@ -1232,7 +1239,7 @@ pub async fn judge_switch(
 
 /// Drops the override, returning the judge to whatever the deployment configures.
 #[post("/judge/reset")]
-pub async fn judge_reset(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+pub async fn judge_reset(_admin: RequireAdmin, state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     let mut con = state
         .redis_pool
         .get()
@@ -1289,8 +1296,8 @@ pub async fn config(state: web::Data<AppState>) -> impl actix_web::Responder {
         judge_threshold: JUDGE_THRESHOLD,
         judge: judge_config(&state),
         auth: AuthConfig {
-            scheme: "api_key",
-            header: "X-API-Key",
+            scheme: "session",
+            header: "Cookie",
         },
         tuning: TuningConfig {
             search_concurrency: tuning.search_concurrency,
@@ -1586,7 +1593,7 @@ pub async fn candidates(
 }
 
 /// Every judgement for one track's candidates, keyed by submission id.
-fn judgements_by_submission(
+pub(crate) fn judgements_by_submission(
     connection: &mut PgConnection,
     track_db_id: i32,
 ) -> Result<HashMap<i32, Vec<JudgementResponse>>, ApiError> {
@@ -1651,7 +1658,7 @@ pub async fn judgements(
             SELECT j.id, j.submission AS submission_id, j.judge, j.model, j.label, j.score,
                    j.accepted, j.latency_ms, j.prompt_version, j.raw, j.error,
                    EXTRACT(EPOCH FROM j.created_at)::bigint AS created_at,
-                   si.id AS track_db_id, si.track AS title, si.artist, si.album,
+                   si.id AS track_db_id, si.track_id AS spotify_id, si.track AS title, si.artist, si.album,
                    dlf.filename, dlf.username
             FROM judgements j
             JOIN judge_submissions js ON j.submission = js.id
@@ -1686,6 +1693,7 @@ pub async fn judgements(
             submission_id: row.judgement.submission_id,
             judgement: row.judgement.into_response(),
             track_db_id: row.track_db_id,
+            spotify_id: row.spotify_id,
             title: row.title,
             artist: row.artist,
             album: row.album,
@@ -2305,7 +2313,7 @@ pub async fn track_report(
 }
 
 #[get("/logs")]
-pub async fn logs(state: web::Data<AppState>) -> impl actix_web::Responder {
+pub async fn logs(_admin: RequireAdmin, state: web::Data<AppState>) -> impl actix_web::Responder {
     let traces_url = format!(
         "{}/api/traces?service=convert-invert&limit=20",
         state.config.jaeger_url.trim_end_matches('/')
@@ -2697,7 +2705,7 @@ pub async fn pipeline_state(state: web::Data<AppState>) -> ApiResult<HttpRespons
 }
 
 #[post("/pipeline/pause")]
-pub async fn pipeline_pause(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+pub async fn pipeline_pause(_admin: RequireAdmin, state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     set_downloads_paused(&state, true)?;
     tracing::info!("Downloads paused via manual stop toggle");
     Ok(HttpResponse::Ok().json(PipelineState {
@@ -2707,7 +2715,7 @@ pub async fn pipeline_pause(state: web::Data<AppState>) -> ApiResult<HttpRespons
 }
 
 #[post("/pipeline/resume")]
-pub async fn pipeline_resume(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+pub async fn pipeline_resume(_admin: RequireAdmin, state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     set_downloads_paused(&state, false)?;
     tracing::info!("Downloads resumed");
     Ok(HttpResponse::Ok().json(PipelineState {
@@ -2739,7 +2747,7 @@ fn now_secs_i64() -> i64 {
 }
 
 /// Scan `dl:*:progress` for live (fresh, non-finished) transfers.
-fn collect_active_downloads(redis_pool: &RedisPool) -> ApiResult<Vec<ActiveDownload>> {
+pub(crate) fn collect_active_downloads(redis_pool: &RedisPool) -> ApiResult<Vec<ActiveDownload>> {
     let mut con = redis_pool
         .get()
         .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
@@ -2785,15 +2793,15 @@ pub async fn active_downloads(state: web::Data<AppState>) -> ApiResult<HttpRespo
     Ok(HttpResponse::Ok().json(collect_active_downloads(&state.redis_pool)?))
 }
 
-struct ActivityMarker {
-    track_id: String,
-    stage: String,
-    title: String,
-    artist: String,
+pub(crate) struct ActivityMarker {
+    pub track_id: String,
+    pub stage: String,
+    pub title: String,
+    pub artist: String,
 }
 
 /// Scan the live `act:<track_id>` markers (searching / judging), dropping stale ones.
-fn activity_markers(redis_pool: &RedisPool) -> ApiResult<Vec<ActivityMarker>> {
+pub(crate) fn activity_markers(redis_pool: &RedisPool) -> ApiResult<Vec<ActivityMarker>> {
     let mut con = redis_pool
         .get()
         .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
@@ -2943,6 +2951,7 @@ pub struct CancelDownloadBody {
 
 #[post("/downloads/cancel")]
 pub async fn cancel_download(
+    _admin: RequireAdmin,
     state: web::Data<AppState>,
     body: web::Json<CancelDownloadBody>,
 ) -> ApiResult<HttpResponse> {

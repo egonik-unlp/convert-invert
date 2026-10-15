@@ -3,6 +3,7 @@ use convert_invert::internals::utils::config::config_manager::Config;
 use convert_invert::internals::worker::worker_manager::WorkerStartOptions;
 use tokio::sync::watch;
 
+use crate::auth::RequireAdmin;
 use crate::errors::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::validation::{StartRequest, StopRequest};
@@ -59,6 +60,8 @@ pub async fn start_workers(
                 random_order: request.random_order,
                 enhanced_retries: request.enhanced_retries,
                 extend_count: request.extend_count,
+                pre_resolved: None,
+                request_id: None,
             },
             base_config,
             user_password,
@@ -75,6 +78,7 @@ pub async fn start_workers(
 
 #[post("/stop")]
 pub async fn stop_workers(
+    _admin: RequireAdmin,
     state: web::Data<AppState>,
     req: web::Json<StopRequest>,
 ) -> ApiResult<HttpResponse> {
@@ -88,7 +92,7 @@ pub async fn stop_workers(
 }
 
 #[actix_web::get("/status")]
-pub async fn worker_status(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+pub async fn worker_status(_admin: RequireAdmin, state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     let status = state
         .worker_supervisor
         .status()
