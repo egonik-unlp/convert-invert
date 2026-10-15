@@ -33,6 +33,7 @@ diesel::table! {
         id -> Int4,
         filename -> Varchar,
         track -> Nullable<Int4>,
+        local_path -> Nullable<Varchar>,
     }
 }
 

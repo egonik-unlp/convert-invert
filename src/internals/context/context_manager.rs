@@ -39,6 +39,9 @@ use crate::internals::{
 pub struct DownloadedFile {
     pub filename: String,
     pub track: SearchItem,
+    /// Where the file was filed on disk, when the move into the playlist folder worked.
+    #[serde(default)]
+    pub local_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1015,6 +1018,7 @@ fn event_from_track(track: &Track) -> Option<RunEvent> {
         Track::File(file) => Some(RunEvent::FileDownloaded(DownloadedFile {
             filename: file.filename.clone(),
             track: file.track.clone(),
+            local_path: file.local_path.clone(),
         })),
         Track::Retry(retry) => Some(RunEvent::RetryQueued {
             request: retry.request.clone(),

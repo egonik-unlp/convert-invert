@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{self, JudgementResponse};
 use crate::auth::Principal;
 use crate::errors::{ApiError, ApiResult};
+use crate::mirror;
 use crate::spotify_user::{self, API_BASE, Image, SpotifyError};
 use crate::state::AppState;
 use convert_invert::internals::judge::judge_manager::JUDGE_THRESHOLD;
@@ -824,6 +825,21 @@ pub fn download_folder(kind: CollectionKind, name: &str, owner: &str) -> Option<
     sanitize_folder_name(&name)
 }
 
+/// Mirror into the collection's folder only if it already exists: the folder is created by a
+/// request, so a collection someone merely looks at doesn't grow one.
+fn mirror_existing_folder(state: &AppState, user_id: i32, meta: &CollectionMeta, spotify_ids: &[String]) {
+    let owner = owner_name(state, user_id);
+    let Some(folder) = download_folder(meta.kind, &meta.name, &owner) else {
+        return;
+    };
+    if !state.config.download_path.join(&folder).is_dir() {
+        return;
+    }
+    if let Err(err) = mirror::mirror_into(state, &folder, spotify_ids) {
+        tracing::warn!(?err, folder, "Mirroring owned songs failed");
+    }
+}
+
 pub fn require_user(principal: &Principal) -> ApiResult<i32> {
     principal
         .user_id()
@@ -859,6 +875,16 @@ pub async fn collection(
             .filter(|((_, now), before)| now != before)
             .filter_map(|((id, _), _)| statuses.get(id).map(|status| StatusChange { spotify_id: id, status }))
             .collect();
+        // Songs that just became downloaded (often through someone else's request) join this
+        // collection's folder, if it has one.
+        let now_owned: Vec<String> = changes
+            .iter()
+            .filter(|change| change.status.state == "owned")
+            .map(|change| change.spotify_id.to_string())
+            .collect();
+        if !now_owned.is_empty() {
+            mirror_existing_folder(&state, user_id, &previous.meta, &now_owned);
+        }
         let counts = count(ordered.iter().copied());
         let body = serde_json::json!({
             "collection": previous.meta,
@@ -897,6 +923,18 @@ pub async fn collection(
         },
     );
     let folder = download_folder(kind, &resolved.meta.name, &owner);
+    if let Some(folder) = folder.as_deref()
+        && state.config.download_path.join(folder).is_dir()
+    {
+        let owned: Vec<String> = ids
+            .iter()
+            .filter(|id| statuses.get(*id).is_some_and(|status| status.state == "owned"))
+            .cloned()
+            .collect();
+        if let Err(err) = mirror::mirror_into(&state, folder, &owned) {
+            tracing::warn!(?err, folder, "Mirroring owned songs failed");
+        }
+    }
     let folder_exists = folder
         .as_deref()
         .is_some_and(|folder| state.config.download_path.join(folder).is_dir());
@@ -909,6 +947,33 @@ pub async fn collection(
         "nextCursor": (end < resolved.tracks.len()).then_some(end),
         "stateToken": token,
     })))
+}
+
+/// Make the collection's folder hold every song of it that is already downloaded (linking the
+/// ones filed elsewhere), creating it if needed. Called right before its .zip is downloaded, so
+/// the zip is complete even when nothing of it was ever requested under this collection.
+#[post("/collections/{kind}/{id}/folder")]
+pub async fn fill_folder(
+    state: web::Data<AppState>,
+    principal: Principal,
+    path: web::Path<(String, String)>,
+) -> ApiResult<HttpResponse> {
+    let user_id = require_user(&principal)?;
+    let (kind, id) = path.into_inner();
+    let kind = CollectionKind::parse(&kind).ok_or(ApiError::NotFound("Unknown collection kind"))?;
+    let owner = owner_name(&state, user_id);
+    let resolved = resolve(&state, user_id, &owner, kind, &id).await?;
+    let folder = download_folder(kind, &resolved.meta.name, &owner)
+        .ok_or_else(|| ApiError::BadRequest("This collection has no usable folder name".into()))?;
+    let ids: Vec<String> = resolved.tracks.iter().map(|track| track.spotify_id.clone()).collect();
+    let statuses = track_statuses(&state, &ids)?;
+    let owned: Vec<String> = ids
+        .into_iter()
+        .filter(|id| statuses.get(id).is_some_and(|status| status.state == "owned"))
+        .collect();
+    let linked = mirror::mirror_into(&state, &folder, &owned)?;
+    let exists = state.config.download_path.join(&folder).is_dir();
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "folder": folder, "folderExists": exists, "linked": linked })))
 }
 
 // ---------------------------------------------------------------------------------------------

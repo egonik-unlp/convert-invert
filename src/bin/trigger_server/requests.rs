@@ -8,7 +8,9 @@ use convert_invert::internals::nexttrack::{self, SeedTrack};
 use convert_invert::internals::query::query_manager::{ResourceKind, fill_albums};
 use convert_invert::internals::search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem};
 use convert_invert::internals::utils::config::config_manager::Config;
-use convert_invert::internals::worker::worker_manager::{PreResolved, WorkerStartOptions, request_run_id_prefix};
+use convert_invert::internals::worker::worker_manager::{
+    PreResolved, WorkerStartOptions, request_run_id_prefix, sanitize_folder_name,
+};
 use diesel::prelude::*;
 use diesel::sql_types::{BigInt, Integer, Nullable, Text};
 use redis::Commands;
@@ -21,6 +23,7 @@ use crate::collections::{
     track_statuses, valid_spotify_id,
 };
 use crate::errors::{ApiError, ApiResult};
+use crate::mirror;
 use crate::state::AppState;
 
 const DEFAULT_CHUNK_SIZE: usize = 15;
@@ -210,8 +213,27 @@ pub async fn create_request(
         name = format!("{name} (extended)");
     }
 
+    // Songs of this collection that are already downloaded (maybe under another collection's
+    // folder) get linked into this request's folder, so the folder and its .zip are complete.
+    let mirrored = match sanitize_folder_name(&name) {
+        Some(folder) => {
+            let wanted: Vec<String> = resolved
+                .tracks
+                .iter()
+                .filter(|track| selection.as_ref().is_none_or(|ids| ids.contains(&track.spotify_id)))
+                .filter(|track| statuses.get(&track.spotify_id).is_some_and(|status| status.state == "owned"))
+                .map(|track| track.spotify_id.clone())
+                .collect();
+            mirror::mirror_into(&state, &folder, &wanted).unwrap_or_else(|err| {
+                tracing::warn!(?err, folder, "Mirroring owned songs failed");
+                0
+            })
+        }
+        None => 0,
+    };
+
     if items.is_empty() {
-        return Ok(HttpResponse::Ok().json(serde_json::json!({ "requestId": null, "queued": 0 })));
+        return Ok(HttpResponse::Ok().json(serde_json::json!({ "requestId": null, "queued": 0, "mirrored": mirrored })));
     }
 
     // The library tag must stay base62 so the per-playlist views can address it.
@@ -253,7 +275,7 @@ pub async fn create_request(
         .await
         .map_err(|err| ApiError::Internal(format!("Failed to start workers: {err}")))?;
     tracing::info!(request_id, user_id, queued, workers = spawned.len(), kind = kind.as_str(), "Download request started");
-    Ok(HttpResponse::Ok().json(serde_json::json!({ "requestId": request_id, "queued": queued })))
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "requestId": request_id, "queued": queued, "mirrored": mirrored })))
 }
 
 // ---------------------------------------------------------------------------------------------

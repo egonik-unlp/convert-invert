@@ -225,6 +225,7 @@ pub struct DownloadedFileRow {
     pub id: i32,
     pub filename: String,
     pub track: Option<i32>,
+    pub local_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -232,6 +233,7 @@ pub struct DownloadedFileRow {
 pub struct NewDownloadedFileRow {
     pub filename: String,
     pub track: Option<i32>,
+    pub local_path: Option<String>,
 }
 
 impl NewDownloadedFileRow {
@@ -239,6 +241,7 @@ impl NewDownloadedFileRow {
         Self {
             filename: value.filename.clone(),
             track,
+            local_path: value.local_path.clone(),
         }
     }
 }

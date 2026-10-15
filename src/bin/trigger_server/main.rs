@@ -19,6 +19,7 @@ mod config;
 mod errors;
 mod files;
 mod middleware;
+mod mirror;
 mod requests;
 mod spotify_user;
 mod state;
@@ -168,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
                     .service(collections::judging)
                     .service(collections::search)
                     .service(collections::collections_status)
+                    .service(collections::fill_folder)
                     .service(requests::create_request)
                     .service(requests::queue)
                     .service(requests::accept_candidate)

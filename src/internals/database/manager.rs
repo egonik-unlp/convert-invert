@@ -131,19 +131,21 @@ impl<'a> DatabaseManager<'a> {
                 .values(&value)
                 .on_conflict(dl::filename)
                 .do_update()
-                .set(dl::track.eq(value.track))
+                .set((dl::track.eq(value.track), dl::local_path.eq(&value.local_path)))
                 .execute(connection)
                 .context("Insert downloaded file without track")?;
             return Ok(());
         };
         diesel::sql_query(
-            "INSERT INTO downloaded_file (filename, track)
-             VALUES ($1, $2)
+            "INSERT INTO downloaded_file (filename, track, local_path)
+             VALUES ($1, $2, $3)
              ON CONFLICT (track) WHERE track IS NOT NULL
-             DO UPDATE SET filename = EXCLUDED.filename",
+             DO UPDATE SET filename = EXCLUDED.filename,
+                           local_path = COALESCE(EXCLUDED.local_path, downloaded_file.local_path)",
         )
         .bind::<Text, _>(&value.filename)
         .bind::<Integer, _>(track_id)
+        .bind::<diesel::sql_types::Nullable<Text>, _>(&value.local_path)
         .execute(connection)
         .context("Insert downloaded file")?;
         Ok(())

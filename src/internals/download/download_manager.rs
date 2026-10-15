@@ -355,11 +355,13 @@ impl DownloadManager {
                     // the finished file into this run's per-playlist folder (root_location).
                     // Same filesystem, so the rename is atomic; the engine still shares
                     // /downloads recursively, so the file stays shared after moving.
+                    let mut local_path = None;
                     if let Some(src) = status.path.clone() {
                         let dir = self.root_location.clone();
                         match tokio::task::spawn_blocking(move || move_into_dir(&dir, &src)).await {
                             Ok(Ok(dest)) => {
-                                tracing::info!(?dest, "Filed download into playlist folder")
+                                tracing::info!(?dest, "Filed download into playlist folder");
+                                local_path = Some(dest.to_string_lossy().into_owned());
                             }
                             Ok(Err(err)) => tracing::warn!(
                                 ?err,
@@ -392,6 +394,7 @@ impl DownloadManager {
                     return Ok(Track::File(DownloadedFile {
                         filename: song.query.filename,
                         track: song.track,
+                        local_path,
                     }));
                 }
                 "FAILED" | "ABORTED" => {
